@@ -1,0 +1,24 @@
+[package]
+name = "souba"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+chrono = "0.4.45"
+chrono-tz = "0.10"
+rust_decimal = "1.42.1"
+encoding_rs = "0.8.35"
+unicode-width = "0.2.2"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+directories = "6.0.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+
+[profile.release]
+lto = true
+strip = true

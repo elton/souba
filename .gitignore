@@ -31,3 +31,6 @@ data/*.parquet
 
 # scratch probe output
 scripts/out/
+
+# rust build
+/target
