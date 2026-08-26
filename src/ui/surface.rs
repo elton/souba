@@ -66,6 +66,8 @@ pub struct Surface {
     pub backend: Backend,
     /// Kitty 模式下待发送的转义序列
     pub escape: Option<String>,
+    /// 本帧已用掉几个图像 slot。每个面板一个，各自独立删除与放置。
+    slot: u32,
 }
 
 impl Surface {
@@ -73,6 +75,7 @@ impl Surface {
         Self {
             backend,
             escape: None,
+            slot: 0,
         }
     }
 
@@ -89,7 +92,13 @@ impl Surface {
 
         match self.backend {
             Backend::Kitty(_) => {
-                let seq = kitty::encode(&canvas, area.x, area.y, area.width, area.height);
+                if self.slot >= kitty::MAX_SLOTS {
+                    // slot 用完了宁可不画，也不要复用别的面板的 id 造成互相覆盖
+                    return;
+                }
+                let seq =
+                    kitty::encode(&canvas, area.x, area.y, area.width, area.height, self.slot);
+                self.slot += 1;
                 match &mut self.escape {
                     Some(acc) => acc.push_str(&seq),
                     None => self.escape = Some(seq),
@@ -234,6 +243,44 @@ mod tests {
         assert_eq!(nearest_ansi(Rgb(0, 255, 0)), Color::Green);
         assert_eq!(nearest_ansi(Rgb(250, 250, 250)), Color::White);
         assert_eq!(nearest_ansi(Rgb(5, 5, 5)), Color::Black);
+    }
+
+    #[test]
+    fn 每个面板用独立的图像slot() {
+        // 两个面板共用一个 id 会互相覆盖，只剩最后画的那个
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 40));
+        let mut s = Surface::new(Backend::Kitty(CellPixels::FALLBACK));
+        s.draw(Rect::new(0, 0, 4, 2), &mut buf, |c| c.set(0, 0, RED));
+        s.draw(Rect::new(0, 5, 4, 2), &mut buf, |c| c.set(0, 0, RED));
+        let esc = s.escape.unwrap();
+        assert!(esc.contains("i=7301,"), "第一个面板应用 slot 0");
+        assert!(esc.contains("i=7302,"), "第二个面板应用 slot 1");
+    }
+
+    #[test]
+    fn 每次绘制先删掉自己上一帧的放置() {
+        // a=T 每次都新建一个放置，光靠固定 id 防不住叠加
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 40));
+        let mut s = Surface::new(Backend::Kitty(CellPixels::FALLBACK));
+        s.draw(Rect::new(0, 0, 4, 2), &mut buf, |c| c.set(0, 0, RED));
+        let esc = s.escape.unwrap();
+        let del = esc.find("a=d,d=I,i=7301").expect("缺少删除指令");
+        let put = esc.find("a=T").expect("缺少放置指令");
+        assert!(del < put, "删除必须在放置之前，否则等于没删");
+    }
+
+    #[test]
+    fn slot用完后不再复用他人的id() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 80));
+        let mut s = Surface::new(Backend::Kitty(CellPixels::FALLBACK));
+        for i in 0..(kitty::MAX_SLOTS + 3) {
+            s.draw(Rect::new(0, (i * 2) as u16, 4, 2), &mut buf, |c| c.set(0, 0, RED));
+        }
+        let esc = s.escape.unwrap();
+        let used = (0..kitty::MAX_SLOTS + 3)
+            .filter(|i| esc.contains(&format!("i={},", 7301 + i)))
+            .count();
+        assert_eq!(used as u32, kitty::MAX_SLOTS, "不该超出 slot 上限");
     }
 
     #[test]

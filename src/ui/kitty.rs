@@ -15,8 +15,12 @@ use std::io::Write;
 
 use crate::ui::canvas::Canvas;
 
-/// 固定 id：每次重发都替换同一张图，不会在终端里堆积
-const IMAGE_ID: u32 = 7301;
+/// 图像 id 基址。每个面板占一个 slot，各用各的 id。
+///
+/// **`a=T` 每次都会新建一个「放置」（placement），`i=<id>` 只去重图像数据、
+/// 不去重放置** —— 所以光靠固定 id 并不能防止叠加，必须在重画前显式删除
+/// 自己的放置。这一点踩过坑：滚动时每帧多两个放置，几帧之后整屏糊掉。
+const IMAGE_ID_BASE: u32 = 7301;
 /// 协议规定分块上限
 const CHUNK: usize = 4096;
 
@@ -99,7 +103,7 @@ fn from_escape_query() -> Option<CellPixels> {
     let _ = out.write_all(b"\x1b[16t\x1b[14t");
     let _ = out.flush();
 
-    let reply = read_with_timeout(120);
+    let reply = read_and_drain(120);
     if raw {
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -128,14 +132,26 @@ fn from_escape_query() -> Option<CellPixels> {
     None
 }
 
-fn read_with_timeout(ms: i32) -> Option<Vec<u8>> {
+/// 读走终端对查询的回应，**并且把 stdin 排空**。
+///
+/// 「读到想要的就停」是错的：残留字节会留在 stdin 里，之后被事件循环
+/// 当成按键。实测过一次 —— 启动时凭空多出一个左箭头，图表一上来就
+/// 滚走了 41 根。所以必须读到 poll 明确超时（确认没有更多数据）为止。
+fn read_and_drain(first_wait_ms: i32) -> Option<Vec<u8>> {
+    const POLLIN: i16 = 0x0001;
+    /// 总预算，避免终端一直吐数据时卡住启动
+    const MAX_ROUNDS: usize = 16;
+    /// 首轮之后只等很短时间 —— 只是确认「没有更多了」
+    const DRAIN_WAIT_MS: i32 = 20;
+
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 256];
-    let deadline_polls = 3;
-    for _ in 0..deadline_polls {
-        let mut pfd = PollFd { fd: 0, events: 0x0001 /* POLLIN */, revents: 0 };
-        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1, ms) };
+    let mut chunk = [0u8; 512];
+    for round in 0..MAX_ROUNDS {
+        let wait = if round == 0 { first_wait_ms } else { DRAIN_WAIT_MS };
+        let mut pfd = PollFd { fd: 0, events: POLLIN, revents: 0 };
+        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1, wait) };
         if rc <= 0 {
+            // poll 超时 = stdin 确实空了，这才是唯一安全的退出条件
             break;
         }
         let n = unsafe { read(0, chunk.as_mut_ptr(), chunk.len()) };
@@ -143,10 +159,6 @@ fn read_with_timeout(ms: i32) -> Option<Vec<u8>> {
             break;
         }
         buf.extend_from_slice(&chunk[..n as usize]);
-        // 两个查询都回了就够了
-        if buf.iter().filter(|b| **b == b't').count() >= 2 {
-            break;
-        }
     }
     if buf.is_empty() { None } else { Some(buf) }
 }
@@ -216,10 +228,13 @@ fn b64(data: &[u8]) -> String {
 /// 生成把画布贴到 (col,row) 的完整转义序列。
 ///
 /// 单独抽成纯函数是为了能测 —— 直接写 stdout 没法断言。
-pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16) -> String {
+pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16, slot: u32) -> String {
+    let id = IMAGE_ID_BASE + slot;
     let payload = b64(canvas.rgba());
     let mut out = String::with_capacity(payload.len() + 256);
-    // 先把光标挪到目标格，再让图像以光标为左上角落下；C=1 表示画完别动光标
+    // 先删掉这个 slot 上一帧的放置，否则新旧会叠在一起
+    out.push_str(&clear_slot(slot));
+    // 再把光标挪到目标格，让图像以光标为左上角落下；C=1 表示画完别动光标
     out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
 
     let chunks: Vec<&str> = payload
@@ -234,7 +249,7 @@ pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16) -> Stri
         let more = u8::from(i + 1 < chunks.len());
         if i == 0 {
             out.push_str(&format!(
-                "\x1b_Ga=T,f=32,t=d,i={IMAGE_ID},s={},v={},c={cols},r={rows},C=1,q=2,m={more};{ch}\x1b\\",
+                "\x1b_Ga=T,f=32,t=d,i={id},s={},v={},c={cols},r={rows},C=1,q=2,m={more};{ch}\x1b\\",
                 canvas.w, canvas.h
             ));
         } else {
@@ -244,10 +259,21 @@ pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16) -> Stri
     out
 }
 
-/// 删除先前贴的图。切屏或退出前调用，免得残留。
-pub fn clear() -> String {
-    format!("\x1b_Ga=d,d=i,i={IMAGE_ID},q=2;\x1b\\")
+/// 删除某个 slot 的图像与其全部放置。
+///
+/// `d=I` 是「按 id 删除图像**及其所有放置**」；只用 `d=i` 会留下数据，
+/// 而我们每帧都重传，留着没意义。
+pub fn clear_slot(slot: u32) -> String {
+    format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", IMAGE_ID_BASE + slot)
 }
+
+/// 清掉本程序用过的所有 slot。切屏或退出前调用，免得残留。
+pub fn clear() -> String {
+    (0..MAX_SLOTS).map(clear_slot).collect()
+}
+
+/// 目前只有主图和指标两个面板，留些余量
+pub const MAX_SLOTS: u32 = 4;
 
 pub fn emit(s: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout();
@@ -294,7 +320,7 @@ mod tests {
     fn 转义序列带齐关键字段() {
         let mut c = Canvas::new(4, 4);
         c.set(0, 0, Rgb(255, 0, 0));
-        let s = encode(&c, 10, 5, 2, 1);
+        let s = encode(&c, 10, 5, 2, 1, 0);
         assert!(s.contains("\x1b_Ga=T"), "缺少传输并显示指令");
         assert!(s.contains("f=32"), "缺少 RGBA 格式声明");
         assert!(s.contains("s=4,v=4"), "缺少图像像素尺寸");
@@ -305,18 +331,20 @@ mod tests {
     }
 
     #[test]
-    fn 光标先定位到目标格() {
+    fn 光标先定位到目标格再放置() {
         let c = Canvas::new(2, 2);
-        let s = encode(&c, 10, 5, 1, 1);
-        // 终端的行列从 1 开始
-        assert!(s.starts_with("\x1b[6;11H"), "定位序列不对：{:?}", &s[..12]);
+        let s = encode(&c, 10, 5, 1, 1, 0);
+        // 终端的行列从 1 开始。序列开头是删除上一帧的放置，定位在它之后。
+        let mv = s.find("\x1b[6;11H").expect("缺少光标定位序列");
+        let put = s.find("a=T").expect("缺少放置指令");
+        assert!(mv < put, "必须先定位再放置，否则图会落在光标当前位置");
     }
 
     #[test]
     fn 大图分块且最后一块标记结束() {
         // 4096 base64 字符对应 3072 字节 = 768 个像素，取远超这个的尺寸
         let c = Canvas::new(200, 200);
-        let s = encode(&c, 0, 0, 20, 10);
+        let s = encode(&c, 0, 0, 20, 10, 0);
         assert!(s.contains("m=1;"), "大图应分块，缺少 m=1");
         assert!(s.contains("m=0;"), "最后一块应标记 m=0");
         let first = s.find("m=1;").unwrap();
@@ -327,19 +355,48 @@ mod tests {
     #[test]
     fn 小图不分块直接标记结束() {
         let c = Canvas::new(4, 4);
-        let s = encode(&c, 0, 0, 1, 1);
+        let s = encode(&c, 0, 0, 1, 1, 0);
         assert!(s.contains("m=0;"), "小图应一次发完");
         assert!(!s.contains("m=1;"), "小图不该分块");
     }
 
     #[test]
-    fn 固定图像id保证重发即替换() {
+    fn 同一slot重发使用同一个id() {
         let c = Canvas::new(4, 4);
-        let a = encode(&c, 0, 0, 1, 1);
-        let b = encode(&c, 5, 5, 1, 1);
-        let id = format!("i={IMAGE_ID}");
-        assert!(a.contains(&id) && b.contains(&id), "两次发送应使用同一个 id");
-        assert!(clear().contains(&id), "删除指令要指向同一个 id");
+        let a = encode(&c, 0, 0, 1, 1, 0);
+        let b = encode(&c, 5, 5, 1, 1, 0);
+        let id = format!("i={IMAGE_ID_BASE},");
+        assert!(a.contains(&id) && b.contains(&id), "同一 slot 两次发送应使用同一个 id");
+    }
+
+    #[test]
+    fn 不同slot使用不同id() {
+        let c = Canvas::new(4, 4);
+        let a = encode(&c, 0, 0, 1, 1, 0);
+        let b = encode(&c, 0, 0, 1, 1, 1);
+        assert!(a.contains(&format!("i={IMAGE_ID_BASE},")));
+        assert!(b.contains(&format!("i={},", IMAGE_ID_BASE + 1)));
+    }
+
+    #[test]
+    fn 每次编码都自带删除上一帧放置的指令() {
+        // 这是叠图 bug 的修复点：a=T 每次新建放置，不删就会堆积
+        let c = Canvas::new(4, 4);
+        let s = encode(&c, 0, 0, 1, 1, 1);
+        let del = s.find(&format!("a=d,d=I,i={}", IMAGE_ID_BASE + 1)).expect("缺少删除指令");
+        let put = s.find("a=T").expect("缺少放置指令");
+        assert!(del < put, "删除必须在放置之前");
+    }
+
+    #[test]
+    fn 全量清除覆盖所有slot() {
+        let all = clear();
+        for slot in 0..MAX_SLOTS {
+            assert!(
+                all.contains(&format!("i={}", IMAGE_ID_BASE + slot)),
+                "slot {slot} 没被清掉"
+            );
+        }
     }
 
     #[test]
