@@ -213,9 +213,15 @@ async fn run(
 
         // 任意移动模式的事件量很大（实测晃 15 秒能产生上万个），
         // 一轮循环只处理一个会越积越多、光标跟不上手。
-        // 所以先阻塞等第一个，再把已排队的一次性排空，然后只画一帧。
+        // 所以先阻塞等第一个，再把已排队的合并掉，然后只画一帧。
+        //
+        // **必须有上限**：鼠标持续移动时事件是源源不断的，
+        // 无上限地「排空到没有为止」会让内层循环永远退不出去，一帧都画不了 ——
+        // 表现就是十字光标彻底不出现。踩过这个坑。
+        const MAX_DRAIN: usize = 64;
         if event::poll(Duration::from_millis(100))? {
             let bars_now = bar_len(&bar_state);
+            let mut drained = 0usize;
             loop {
                 match event::read()? {
                     Event::Key(k) => app.on_key_with(k, watch.len(), bars_now),
@@ -231,8 +237,9 @@ async fn run(
                     }
                     _ => {}
                 }
+                drained += 1;
                 // 零超时 poll = 「还有没有已经到了的事件」
-                if app.should_quit || !event::poll(Duration::ZERO)? {
+                if app.should_quit || drained >= MAX_DRAIN || !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
