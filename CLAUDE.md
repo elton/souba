@@ -13,8 +13,10 @@ and an LLM that turns strategy output into recommendations. Human-facing overvie
 Markets: **A-share, Hong Kong, US, Japan.** Single user — this is a personal tool, not a product.
 That decision is load-bearing: **no auth, no multi-tenancy, no quota system.** Do not add them.
 
-**Status: research validated, design not finalized, no product code exists.** Do not scaffold the
-application until the design doc in `docs/decisions/` is written and approved.
+**Status: design approved, no product code exists.** The design is
+[`docs/decisions/2026-08-26-souba-设计.md`](docs/decisions/2026-08-26-souba-设计.md) — read it before
+writing anything. Implementation is phased; **Phase 0 (verify Cloudflare Worker egress can actually
+reach Tencent/Sina) gates everything else**, because every probe so far ran from a residential IP.
 
 ## Verified facts that must not be re-derived
 
@@ -107,8 +109,11 @@ EMA576 / EMA676    slow tunnel   — governs holding and exit  (= fast tunnel x 
 **The tunnel is a band, not a line.** A single candle piercing it is not a valid breakout — that
 band is the whole point, and any implementation that collapses it to one EMA has lost the strategy.
 
-Vegas is the **first** strategy, not the only one. Keep the strategy interface pluggable, but do not
-invent abstraction for strategies that do not exist yet — one concrete implementation first.
+Vegas is the **first** strategy, not the only one. The `Strategy` trait is a deliberate abstraction
+(the user chose this over a single concrete implementation) — its shape is in §7 of the design doc and
+was checked against MACD-cross, KDJ and Bollinger-breakout so it does not end up shaped around Vegas
+alone. `Signal` deliberately does **not** collapse to one score: each facet fails for a different
+reason, and that "why" is exactly what gets fed to the LLM.
 
 ## Credentials
 
