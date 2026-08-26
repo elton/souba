@@ -34,34 +34,46 @@ impl CellPixels {
     pub const FALLBACK: CellPixels = CellPixels { w: 10, h: 20 };
 }
 
-/// 通过 ioctl 问内核要窗口的像素尺寸，除以字符格数得到每格像素。
+/// 问终端要「每个字符格多少像素」。
 ///
-/// 很多终端不填 `ws_xpixel`/`ws_ypixel`（返回 0），此时返回 None，
-/// 调用方应当据此判定位图不可用。
+/// 先试 ioctl（最快，不需要读回响应），拿不到再发转义序列问 ——
+/// **otty 实测 `ws_xpixel`/`ws_ypixel` 都是 0**，所以转义查询这条路是必需的，
+/// 不是锦上添花。
+///
+/// 拿不到就返回 None，调用方据此降级到盲文。宁可画质差，不可把图像拉伸变形。
 pub fn detect_cell_pixels() -> Option<CellPixels> {
-    #[repr(C)]
-    struct WinSize {
-        rows: u16,
-        cols: u16,
-        xpixel: u16,
-        ypixel: u16,
-    }
-    unsafe extern "C" {
-        fn ioctl(fd: i32, request: u64, ...) -> i32;
-    }
+    from_ioctl().or_else(from_escape_query)
+}
+
+#[repr(C)]
+struct WinSize {
+    rows: u16,
+    cols: u16,
+    xpixel: u16,
+    ypixel: u16,
+}
+
+unsafe extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+fn from_ioctl() -> Option<CellPixels> {
     // macOS 与 Linux 的 TIOCGWINSZ 常量不同
     #[cfg(target_os = "macos")]
     const TIOCGWINSZ: u64 = 0x4008_7468;
     #[cfg(not(target_os = "macos"))]
     const TIOCGWINSZ: u64 = 0x5413;
 
-    let mut ws = WinSize {
-        rows: 0,
-        cols: 0,
-        xpixel: 0,
-        ypixel: 0,
-    };
-    // 1 = stdout
+    let mut ws = WinSize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
     let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut WinSize) };
     if rc != 0 || ws.cols == 0 || ws.rows == 0 || ws.xpixel == 0 || ws.ypixel == 0 {
         return None;
@@ -70,6 +82,101 @@ pub fn detect_cell_pixels() -> Option<CellPixels> {
         w: (ws.xpixel / ws.cols).max(1),
         h: (ws.ypixel / ws.rows).max(1),
     })
+}
+
+/// 发 `CSI 16 t` 问每格像素，终端回 `CSI 6 ; 高 ; 宽 t`。
+/// 拿不到就退而求其次发 `CSI 14 t` 问整窗像素，再除以字符格数。
+///
+/// **必须在 ratatui 接管终端之前调用** —— 之后 stdin 归事件循环，
+/// 在这里抢读会把响应吞掉或把按键读丢。
+fn from_escape_query() -> Option<CellPixels> {
+    use std::io::Write;
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return None;
+    }
+    let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[16t\x1b[14t");
+    let _ = out.flush();
+
+    let reply = read_with_timeout(120);
+    if raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    let reply = reply?;
+
+    // CSI 6 ; h ; w t —— 直接就是每格像素
+    if let Some(v) = parse_csi_t(&reply, b'6')
+        && v.0 > 0
+        && v.1 > 0
+    {
+        return Some(CellPixels { w: v.1, h: v.0 });
+    }
+    // CSI 4 ; h ; w t —— 整窗像素，除以字符格数
+    if let Some((ph, pw)) = parse_csi_t(&reply, b'4')
+        && let Ok((cols, rows)) = crossterm::terminal::size()
+        && cols > 0
+        && rows > 0
+        && ph > 0
+        && pw > 0
+    {
+        return Some(CellPixels {
+            w: (pw / cols).max(1),
+            h: (ph / rows).max(1),
+        });
+    }
+    None
+}
+
+fn read_with_timeout(ms: i32) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    let deadline_polls = 3;
+    for _ in 0..deadline_polls {
+        let mut pfd = PollFd { fd: 0, events: 0x0001 /* POLLIN */, revents: 0 };
+        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1, ms) };
+        if rc <= 0 {
+            break;
+        }
+        let n = unsafe { read(0, chunk.as_mut_ptr(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        // 两个查询都回了就够了
+        if buf.iter().filter(|b| **b == b't').count() >= 2 {
+            break;
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// 从 `ESC [ <kind> ; a ; b t` 里取出 (a, b)。
+///
+/// 注意不能在循环里用 `?` —— `split` 的第一个片段是 ESC 之前的空串，
+/// 用 `?` 会让整个函数在第一轮就返回 None。
+fn parse_csi_t(buf: &[u8], kind: u8) -> Option<(u16, u16)> {
+    let text = String::from_utf8_lossy(buf);
+    for part in text.split('\u{1b}') {
+        let Some(body) = part.strip_prefix('[') else {
+            continue;
+        };
+        // 响应可能后面还粘着别的内容，取到第一个 't' 为止
+        let Some(body) = body.split('t').next() else {
+            continue;
+        };
+        let mut it = body.split(';');
+        if it.next() != Some(std::str::from_utf8(&[kind]).unwrap_or("")) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if let (Ok(a), Ok(b)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
+            return Some((a, b));
+        }
+    }
+    None
 }
 
 /// 终端是否可能支持 Kitty 图形协议。
@@ -100,16 +207,8 @@ fn b64(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if c.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
     }
     out
 }
@@ -253,6 +352,39 @@ mod tests {
         assert!(!supported());
         unsafe {
             std::env::remove_var("TMUX");
+        }
+    }
+
+    #[test]
+    fn 解析每格像素响应() {
+        // CSI 6 ; 高 ; 宽 t
+        assert_eq!(parse_csi_t(b"\x1b[6;38;19t", b'6'), Some((38, 19)));
+    }
+
+    #[test]
+    fn 解析整窗像素响应() {
+        assert_eq!(parse_csi_t(b"\x1b[4;1200;2400t", b'4'), Some((1200, 2400)));
+    }
+
+    #[test]
+    fn 两个响应粘在一起也能各自取出() {
+        // 我们一次发两个查询，响应会连在一起回来
+        let buf = b"\x1b[6;38;19t\x1b[4;2394;4389t";
+        assert_eq!(parse_csi_t(buf, b'6'), Some((38, 19)));
+        assert_eq!(parse_csi_t(buf, b'4'), Some((2394, 4389)));
+    }
+
+    #[test]
+    fn 响应类型不匹配时返回none() {
+        assert_eq!(parse_csi_t(b"\x1b[4;100;200t", b'6'), None);
+        assert_eq!(parse_csi_t(b"", b'6'), None);
+        assert_eq!(parse_csi_t(b"garbage", b'6'), None);
+    }
+
+    #[test]
+    fn 残缺响应不panic() {
+        for bad in [&b"\x1b[6;38t"[..], b"\x1b[6;t", b"\x1b[", b"\x1b[6;abc;def t"] {
+            let _ = parse_csi_t(bad, b'6');
         }
     }
 
