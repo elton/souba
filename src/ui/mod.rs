@@ -3,6 +3,7 @@ pub mod canvas;
 pub mod detail;
 pub mod kitty;
 pub mod surface;
+pub mod timeaxis;
 pub mod viewport;
 pub mod layout;
 pub mod paint;

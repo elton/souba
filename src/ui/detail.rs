@@ -12,6 +12,7 @@ use crate::core::quote::Quote;
 use crate::core::symbol::Symbol;
 use crate::ui::paint;
 use crate::ui::surface::Surface;
+use crate::ui::timeaxis;
 use crate::ui::viewport::Viewport;
 
 /// 详情面板要显示的指标
@@ -97,8 +98,11 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     frame.render_widget(chart_block, chart_area);
 
     let axis_w = AXIS_W.min(inner.width);
-    let plot = Rect::new(inner.x, inner.y, inner.width.saturating_sub(axis_w), inner.height);
-    let axis = Rect::new(inner.x + plot.width, inner.y, axis_w, inner.height);
+    // 底部留一行给时间刻度
+    let time_h = u16::from(inner.height > 4);
+    let body_h = inner.height.saturating_sub(time_h);
+    let plot = Rect::new(inner.x, inner.y, inner.width.saturating_sub(axis_w), body_h);
+    let axis = Rect::new(inner.x + plot.width, inner.y, axis_w, body_h);
 
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
@@ -106,6 +110,15 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     });
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
+    }
+    if time_h > 0 {
+        render_time_axis(
+            frame,
+            Rect::new(inner.x, inner.y + body_h, plot.width, 1),
+            window,
+            v.timeframe,
+            v.symbol.market.timezone(),
+        );
     }
 
     let ind_block = Block::default()
@@ -142,6 +155,37 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
             };
             surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k));
         }
+    }
+}
+
+/// 横轴时间刻度。标签左边缘对齐所标的那根 K 线，最后一个右对齐
+/// 免得被面板边框截断。
+fn render_time_axis(
+    frame: &mut Frame,
+    area: Rect,
+    bars: &[Bar],
+    tf: Timeframe,
+    tz: chrono_tz::Tz,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default().fg(Color::Gray);
+    let ticks = timeaxis::ticks(bars, tf, tz, area.width);
+    let last = ticks.len().saturating_sub(1);
+    for (i, t) in ticks.iter().enumerate() {
+        let label_w = t.label.chars().count() as u16;
+        let col = timeaxis::column_of(t.index, bars.len(), area.width);
+        // 最后一个刻度右对齐，否则会被边框切掉半个日期
+        let x = if i == last {
+            area.width.saturating_sub(label_w)
+        } else {
+            col.min(area.width.saturating_sub(label_w))
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(t.label.clone(), style)),
+            Rect::new(area.x + x, area.y, label_w.min(area.width - x), 1),
+        );
     }
 }
 
@@ -402,6 +446,46 @@ mod axis_tests {
         let (lo, hi) = vp.range(1500);
         let t = text(&draw_vp(120, 40, 1500, vp), 120, 40);
         assert!(t.contains(&format!("{} 根", hi - lo)), "标题应反映缩放后的根数");
+    }
+
+    #[test]
+    fn 横轴显示日期() {
+        let t = text(&draw(160, 40, 300), 160, 40);
+        // fixture 的 K 线从 2026-01-01 起按天递增
+        assert!(t.contains("2026-"), "横轴没有日期刻度：{}", &t[t.len().saturating_sub(400)..]);
+    }
+
+    #[test]
+    fn 横轴刻度落在图表下沿不占用蜡烛区() {
+        let (w, h) = (160u16, 40u16);
+        let buf = draw(w, h, 300);
+        let lines: Vec<String> = (0..h).map(|y| {
+            let mut out = String::new();
+            let mut x = 0u16;
+            while x < w {
+                let sym = buf[(x, y)].symbol();
+                out.push_str(sym);
+                x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+            }
+            out
+        }).collect();
+        let dated: Vec<usize> = lines.iter().enumerate()
+            .filter(|(_, l)| l.contains("2026-"))
+            .map(|(i, _)| i).collect();
+        assert!(!dated.is_empty(), "找不到日期行");
+        // K 线区占 Fill(3)，指标区 Fill(1)。日期应贴在 K 线区下沿。
+        let chart_bottom = (3 + (h - 3) * 3 / 4) as usize;
+        assert!(
+            dated.iter().all(|y| *y < chart_bottom),
+            "日期行 {dated:?} 应在 K 线区内（< {chart_bottom}），不该跑到指标区"
+        );
+    }
+
+    #[test]
+    fn 面板太矮时不挤时间轴() {
+        // 高度不够就把整行让给蜡烛，别为了刻度把图压没
+        let _ = draw(160, 10, 100);
+        let _ = draw(160, 24, 100);
     }
 
     #[test]
