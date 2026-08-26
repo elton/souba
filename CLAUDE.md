@@ -39,9 +39,17 @@ memory — these endpoints are undocumented and drift.
   prefix) HK are realtime; JP via Tencent lags 15-20 min and the lag drifts. Derive latency at runtime
   from `response timestamp vs market clock`; never hardcode it. **The TUI must label the real latency
   of every quote.** Presenting delayed data as live is the one product lie this codebase must never tell.
-- **Sina `CN_MarketDataService` is the deep-history source, and it solves EMA576.** `datalen=1800`
-  returns 1800 daily bars (7.4 years); 2000 returns empty, so the cap sits between. **It must be called
-  with forced HTTP/1.1** — the HTTPS+HTTP/2 path hangs and never returns. This covers A-share only.
+- **Sina has TWO similar-looking kline endpoints and they differ by an order of magnitude.** Use
+  `money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData` — it returns a
+  symbol's ENTIRE history (5990 daily bars for sh600519, back to 2001; 3905 60-min bars; 6000 for the
+  SSE index). The other one, `quotes.sina.cn/.../CN_MarketDataService.getKLineData`, caps at 1800.
+  **Both must be called with forced HTTP/1.1** — the HTTPS+HTTP/2 path hangs and never returns.
+  This solves EMA576 outright for A-share: seed residue at 5990 bars is 9e-10. **A-share only** —
+  HK/US/JP symbols all return an empty array.
+- **Tencent quotes are batched, up to 100 symbols per request, mixing markets freely.**
+  `qt.gtimg.cn/q=sh600519,r_hk00700,usAAPL,jp7203` returns all of them in one call. The whole watchlist
+  refreshes in a single request regardless of market — do not poll symbol by symbol, and do not split
+  by market. This also cuts the IP-ban risk substantially.
 - **Every free source IP-bans under sustained polling.** Sina started returning empty after ~10 rapid
   requests and recovered after 6-8s spacing; Eastmoney blocked outright. **The data layer must have
   built-in throttling, caching and exponential backoff.** Never poll these endpoints bare.

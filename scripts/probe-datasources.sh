@@ -27,7 +27,7 @@ hdr 'Tencent qt.gtimg.cn — one endpoint, four markets (GBK encoded)'
 echo '  NOTE: for HK the r_ prefix is REALTIME and the bare prefix is 15-min DELAYED.'
 echo '        They are twins on the same host — the prefix is the only difference.'
 for pair in "sh600519 A-share" "hk00700 HK-delayed" "r_hk00700 HK-REALTIME" "usAAPL US" "jp7203 JP"; do
-  set -- $pair
+  set -- ${=pair}
   code=$(curl -s -m 15 -o "$TMP/q" -w '%{http_code}' "https://qt.gtimg.cn/q=$1")
   body=$(iconv -f GBK -t UTF-8 "$TMP/q" 2>/dev/null || cat "$TMP/q")
   # field 31 is the quote timestamp in Tencent's ~-delimited payload
@@ -43,7 +43,7 @@ echo '  NOTE: compare ts against the market clock above — HK lags ~15min, JP ~
 
 hdr 'Sina hq.sinajs.cn — backup source, and the only free REALTIME HK (rt_ prefix)'
 for pair in "sh600519 A-share" "gb_aapl US" "hk00700 HK-delay" "rt_hk00700 HK-REALTIME"; do
-  set -- $pair
+  set -- ${=pair}
   code=$(curl -s -m 15 -o "$TMP/q" -w '%{http_code}' \
     -H 'Referer: https://finance.sina.com.cn' "https://hq.sinajs.cn/list=$1")
   body=$(iconv -f GBK -t UTF-8 "$TMP/q" 2>/dev/null || cat "$TMP/q")
@@ -91,23 +91,26 @@ usAAPL day 640 US daily — expect ~2 bars, unusable
 jp7203 day 640 JP daily — expect ~1 bar, unusable
 ROWS
 
-hdr 'Sina CN_MarketDataService — the deep-history source that makes EMA576 possible'
-echo '  MUST force HTTP/1.1: the HTTPS+HTTP/2 path hangs. datalen caps between 1800 and 2000.'
-for spec in "240 1800 daily" "240 2000 daily-over-cap" "60 1500 60min" "5 1500 5min"; do
-  set -- $spec
+hdr 'Sina money.finance.sina.com.cn — full history, and what makes EMA576 exact'
+echo '  NOTE the host and class name. quotes.sina.cn/CN_MarketDataService caps at 1800 bars;'
+echo '  money.finance.sina.com.cn/CN_MarketData returns the symbol ENTIRE history. Use the latter.'
+echo '  MUST force HTTP/1.1 — the HTTPS+HTTP/2 path hangs and never returns.'
+for spec in "240 6000 daily" "1680 6000 weekly" "60 6000 60min" "5 6000 5min"; do
+  set -- ${=spec}
   printf '  scale=%-4s datalen=%-5s %-16s ' "$1" "$2" "$3"
   sleep 6   # these endpoints IP-ban under sustained polling — pace every request
   curl -s -m 40 --http1.1 -o "$TMP/sk" -H "User-Agent: $UA" \
-    "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?symbol=sh600519&scale=$1&ma=no&datalen=$2"
+    -H 'Referer: https://finance.sina.com.cn' \
+    "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh600519&scale=$1&ma=no&datalen=$2"
   cnt=$(python3 -c "
 import json,sys
 try: d=json.load(open('$TMP/sk')); print('%d %s %s'%(len(d),d[0]['day'],d[-1]['day']))
 except Exception: print('0 - -')
 ")
-  set -- $cnt
-  [ "$1" -gt 1000 ] && ok "bars=$1  $2 .. $3" || bad "bars=$1 (empty = over the cap, or rate-limited)"
+  set -- ${=cnt}
+  [ "$1" -gt 1000 ] && ok "bars=$1  $2 .. $3" || bad "bars=$1 (empty = unsupported symbol, or rate-limited)"
 done
-echo '  EMA576 needs ~1330 daily bars for <1% seed error — 1800 clears it, 640 does not.'
+echo '  EMA576 needs ~1330 daily bars for <1% seed error. 5990 bars puts the residue at 9e-10.'
 
 # ---------------------------------------------------------------- known-bad sources
 hdr 'Sources already ruled out — confirming they are still bad'
