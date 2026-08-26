@@ -29,6 +29,12 @@ memory — these endpoints are undocumented and drift.
   quotes 1 second old; the bare `hk00700` twin on the same host is 15-22 min stale. Measured against
   a live session clock, confirmed on both vendors. **Always use the `r_`/`rt_` form for HK.** JP has
   no such twin — `r_jp7203` and `rt_jp7203` both return empty.
+- **JP realtime exists only on Yahoo Finance Japan, and only by scraping.** Measured across the TSE
+  afternoon open: Yahoo `finance.yahoo.co.jp/quote/7203.T` tracked the live clock (12:34/12:36/12:37,
+  price moving) while Tencent `jp7203` sat frozen on the 11:30 morning close. There is no JSON
+  endpoint — the data lives in a Next.js RSC flight stream behind build-hashed CSS class names, so it
+  **will break when Yahoo redeploys**. Build the JP adapter with a fallback to Tencent's delayed feed
+  and surface which one is live in the UI; never let a broken scraper silently show stale prices.
 - **Quote latency differs per market and must be computed, not assumed.** A-share and (with the right
   prefix) HK are realtime; JP via Tencent lags 15-20 min and the lag drifts. Derive latency at runtime
   from `response timestamp vs market clock`; never hardcode it. **The TUI must label the real latency
