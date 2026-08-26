@@ -108,9 +108,13 @@ fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
                 let text = match c.key {
                     ColumnKey::Code => q.symbol.to_string(),
                     ColumnKey::Name => q.name.clone(),
-                    ColumnKey::Last => q.last.normalize().to_string(),
-                    ColumnKey::ChangePct => format!("{}%", q.change_pct.normalize()),
-                    ColumnKey::Change => q.change.normalize().to_string(),
+                    // 不做 normalize —— 各市场报价精度不同（A股 2 位、港股 3 位、
+                    // 日股整数），源自己的标度就是它的最小报价单位，抹掉尾随零
+                    // 会让同一列出现 446.4 和 1303.38 这种参差。
+                    ColumnKey::Last => q.last.to_string(),
+                    ColumnKey::Change => q.change.to_string(),
+                    // 涨跌幅例外：日股会给到 8 位小数（-0.03244646），必须收敛
+                    ColumnKey::ChangePct => format!("{:.2}%", q.change_pct),
                     ColumnKey::Freshness => freshness_label(q.freshness(now)),
                 };
                 let style = match c.key {
