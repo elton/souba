@@ -3,52 +3,149 @@ mod source;
 mod store;
 mod ui;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
+use ratatui::Frame;
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
+use crate::core::bar::Timeframe;
 use crate::core::quote::Quote;
 use crate::core::symbol::Symbol;
 use crate::source::QuoteSource;
+use crate::source::history::{HistoryClient, HistoryError};
 use crate::source::tencent::TencentSource;
 use crate::store::Store;
-use crate::ui::App;
+use crate::ui::detail::{BarState, DetailView};
 use crate::ui::layout::{Breakpoint, MIN_HEIGHT, MIN_WIDTH, split};
 use crate::ui::watchlist::{ColumnKey, columns_for, freshness_label, truncate_display};
+use crate::ui::{App, Screen};
 
 /// 盘中刷新间隔。节流器保证不会打得更快。
 const REFRESH: Duration = Duration::from_secs(3);
+/// 一次拉多少根历史。EMA576 要 1330 根才收敛，日线给足；
+/// 分钟线源本身也给不了这么多，多要无害。
+const HISTORY_BARS: usize = 1500;
+
+/// 历史加载请求：标的 + 周期
+type BarKey = (Symbol, Timeframe);
+
+/// 把命令行给的代码解析成 Symbol。
+///
+/// 完整形式 `CN:600519` 永远可用；裸 6 位数字按 A股 处理（这是唯一无歧义的简写 ——
+/// 4 位既可能是港股也可能是日股，5 位港股与美股代码也会撞，所以其余一律要求写市场前缀）。
+fn parse_cli_symbol(raw: &str) -> anyhow::Result<Symbol> {
+    let t = raw.trim();
+    if t.contains(':') {
+        return Symbol::parse(t).map_err(Into::into);
+    }
+    if t.len() == 6 && t.chars().all(|c| c.is_ascii_digit()) {
+        return Symbol::parse(&format!("CN:{t}")).map_err(Into::into);
+    }
+    anyhow::bail!(
+        "无法判断 {t:?} 属于哪个市场，请带上前缀，例如 CN:600519 / HK:00700 / US:AAPL / JP:7203\n\
+         （只有 6 位纯数字可以省略前缀，按 A股 处理）"
+    )
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let store = Store::open(&Store::default_path()?)?;
     seed_if_empty(&store)?;
 
-    let source = TencentSource::new()?;
-    let (tx, mut rx) = tokio::sync::watch::channel(Vec::<Quote>::new());
+    let arg = std::env::args().nth(1);
+    if matches!(arg.as_deref(), Some("-h" | "--help")) {
+        println!(
+            "souba — 终端行情与策略终端\n\n\
+             用法：\n  \
+             souba              打开自选股列表\n  \
+             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700"
+        );
+        return Ok(());
+    }
+    let direct = match arg {
+        Some(a) => Some(parse_cli_symbol(&a)?),
+        None => None,
+    };
 
-    // 后台刷新：与渲染解耦，网络慢不会卡住界面
-    let watch: Vec<Symbol> = store.watchlist()?.into_iter().map(|w| w.symbol).collect();
+    let mut watch: Vec<Symbol> = store.watchlist()?.into_iter().map(|w| w.symbol).collect();
+    // 命令行指定的标的不在自选股里也要能看 —— 但不写进库，避免顺手查一次就污染自选股
+    if let Some(d) = &direct
+        && !watch.contains(d)
+    {
+        watch.insert(0, d.clone());
+    }
+    let watch = watch;
+
+    // 报价：后台常驻刷新
+    let (qtx, mut qrx) = tokio::sync::watch::channel(Vec::<Quote>::new());
+    let quote_syms = watch.clone();
     tokio::spawn(async move {
+        let source = match TencentSource::new() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[souba] 报价源初始化失败：{e}");
+                return;
+            }
+        };
         loop {
-            match source.quotes(&watch).await {
+            match source.quotes(&quote_syms).await {
                 Ok(qs) => {
-                    let _ = tx.send(qs);
+                    let _ = qtx.send(qs);
                 }
-                // 界面已经在跑，这里不能 panic —— 打日志后按节奏重试
                 Err(e) => eprintln!("[souba] 刷新失败：{e}"),
             }
             tokio::time::sleep(REFRESH).await;
         }
     });
 
+    // 历史：按需加载，请求走 channel，结果走 watch
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<BarKey>(8);
+    let (bar_tx, mut bar_rx) =
+        tokio::sync::watch::channel::<(Option<BarKey>, BarState)>((None, BarState::Loading));
+    tokio::spawn(async move {
+        let client = match HistoryClient::new() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                let _ = bar_tx.send((None, BarState::Failed(e.to_string())));
+                return;
+            }
+        };
+        while let Some(key) = req_rx.recv().await {
+            let _ = bar_tx.send((Some(key.clone()), BarState::Loading));
+            let state = match client.bars(&key.0, key.1, HISTORY_BARS).await {
+                Ok(bars) => BarState::Ready(bars),
+                // 「没有数据源」和「拉取失败」要分开 —— 前者重试多少次都没用
+                Err(e @ (HistoryError::MarketUnsupported(_)
+                | HistoryError::TimeframeUnsupported { .. })) => {
+                    BarState::Unsupported(e.to_string())
+                }
+                Err(e) => BarState::Failed(e.to_string()),
+            };
+            let _ = bar_tx.send((Some(key), state));
+        }
+    });
+
     let mut terminal = ratatui::init();
     let mut app = App::new();
-    let result = run(&mut terminal, &mut app, &mut rx).await;
+    if let Some(d) = &direct {
+        app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
+        app.screen = Screen::Detail;
+        app.bars_dirty = true;
+    }
+    let result = run(
+        &mut terminal,
+        &mut app,
+        &watch,
+        &mut qrx,
+        &req_tx,
+        &mut bar_rx,
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -56,22 +153,41 @@ async fn main() -> anyhow::Result<()> {
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    rx: &mut tokio::sync::watch::Receiver<Vec<Quote>>,
+    watch: &[Symbol],
+    qrx: &mut tokio::sync::watch::Receiver<Vec<Quote>>,
+    req_tx: &tokio::sync::mpsc::Sender<BarKey>,
+    bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
 ) -> anyhow::Result<()> {
     while !app.should_quit {
-        let quotes = rx.borrow().clone();
-        terminal.draw(|f| draw(f, app, &quotes))?;
-        // 有按键就处理，没有就 100ms 后重绘 —— 让新鲜度显示随时间走
+        if app.bars_dirty {
+            app.bars_dirty = false;
+            if let Some(sym) = watch.get(app.selected) {
+                // 满了就丢弃这次请求 —— 用户还在连按切换，最后一次会补上
+                let _ = req_tx.try_send((sym.clone(), app.timeframe));
+            }
+        }
+
+        let quotes = qrx.borrow().clone();
+        let (bar_key, bar_state) = bar_rx.borrow().clone();
+        terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state))?;
+
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(k) = event::read()?
         {
-            app.on_key(k, quotes.len());
+            app.on_key(k, watch.len());
         }
     }
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
+fn draw(
+    frame: &mut Frame,
+    app: &App,
+    watch: &[Symbol],
+    quotes: &[Quote],
+    bar_key: &Option<BarKey>,
+    bar_state: &BarState,
+) {
     let area = frame.area();
     let bp = Breakpoint::of(area);
     if bp == Breakpoint::TooSmall {
@@ -83,8 +199,6 @@ fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
     }
 
     let panes = split(area);
-    let now = chrono::Utc::now();
-
     frame.render_widget(
         Paragraph::new(Span::styled(
             " souba  相場",
@@ -93,6 +207,55 @@ fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
         panes.header,
     );
 
+    match app.screen {
+        Screen::Watchlist => {
+            draw_watchlist(frame, panes.body, app, quotes, bp);
+            frame.render_widget(
+                Paragraph::new(" ↑↓/jk 移动   Enter 详情   q 退出")
+                    .style(Style::default().fg(Color::DarkGray)),
+                panes.footer,
+            );
+        }
+        Screen::Detail => {
+            let sym = watch.get(app.selected);
+            let quote = sym.and_then(|s| quotes.iter().find(|q| &q.symbol == s));
+            // 请求的键与回来的键不一致时说明还在路上，不要拿旧标的的数据冒充新标的
+            let want = sym.map(|s| (s.clone(), app.timeframe));
+            let state = if bar_key == &want {
+                bar_state.clone()
+            } else {
+                BarState::Loading
+            };
+            if let Some(sym) = sym {
+                ui::detail::render(
+                    frame,
+                    panes.body,
+                    &DetailView {
+                        symbol: sym,
+                        quote,
+                        timeframe: app.timeframe,
+                        indicator: app.indicator,
+                        bars: &state,
+                    },
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(" ←→/Tab 切周期   ↑↓ 切标的   i 切指标   Esc/q 返回")
+                    .style(Style::default().fg(Color::DarkGray)),
+                panes.footer,
+            );
+        }
+    }
+}
+
+fn draw_watchlist(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    quotes: &[Quote],
+    bp: Breakpoint,
+) {
+    let now = chrono::Utc::now();
     let cols = columns_for(bp);
     let header = Row::new(
         cols.iter()
@@ -109,11 +272,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
                     ColumnKey::Code => q.symbol.to_string(),
                     ColumnKey::Name => q.name.clone(),
                     // 不做 normalize —— 各市场报价精度不同（A股 2 位、港股 3 位、
-                    // 日股整数），源自己的标度就是它的最小报价单位，抹掉尾随零
-                    // 会让同一列出现 446.4 和 1303.38 这种参差。
+                    // 日股整数），源自己的标度就是它的最小报价单位。
                     ColumnKey::Last => q.last.to_string(),
                     ColumnKey::Change => q.change.to_string(),
-                    // 涨跌幅例外：日股会给到 8 位小数（-0.03244646），必须收敛
+                    // 涨跌幅例外：日股会给到 8 位小数，必须收敛
                     ColumnKey::ChangePct => format!("{:.2}%", q.change_pct),
                     ColumnKey::Freshness => freshness_label(q.freshness(now)),
                 };
@@ -134,12 +296,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App, quotes: &[Quote]) {
         .block(Block::default().borders(Borders::ALL).title("自选股"));
 
     let mut state = TableState::default().with_selected(Some(app.selected));
-    frame.render_stateful_widget(table, panes.body, &mut state);
-
-    frame.render_widget(
-        Paragraph::new(" ↑↓/jk 移动   q 退出").style(Style::default().fg(Color::DarkGray)),
-        panes.footer,
-    );
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 /// 首次运行时放几只进去，免得开局是空屏。
@@ -161,7 +318,7 @@ fn seed_if_empty(store: &Store) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod render_tests {
+pub(crate) mod render_tests {
     use super::*;
     use crate::core::symbol::Symbol;
     use chrono::{TimeZone, Utc};
@@ -189,7 +346,7 @@ mod render_tests {
         }
     }
 
-    fn sample() -> Vec<Quote> {
+    pub(crate) fn sample() -> Vec<Quote> {
         vec![
             quote("CN:600519", "贵州茅台", "1303.38"),
             quote("HK:00700", "腾讯控股", "446.4"),
@@ -197,10 +354,20 @@ mod render_tests {
         ]
     }
 
-    fn render_at(w: u16, h: u16) -> Buffer {
+    fn watch() -> Vec<Symbol> {
+        sample().iter().map(|q| q.symbol.clone()).collect()
+    }
+
+    pub(crate) fn render_at(w: u16, h: u16) -> Buffer {
+        render_with(w, h, &App::new(), &BarState::Loading)
+    }
+
+    pub(crate) fn render_with(w: u16, h: u16, app: &App, bars: &BarState) -> Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let app = App::new();
-        term.draw(|f| draw(f, &app, &sample())).unwrap();
+        let watch = watch();
+        let key = watch.first().map(|s| (s.clone(), app.timeframe));
+        term.draw(|f| draw(f, app, &watch, &sample(), &key, bars))
+            .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -292,5 +459,161 @@ mod render_tests {
         let q = &sample()[0];
         let 周六 = Utc.with_ymd_and_hms(2026, 8, 29, 2, 30, 0).unwrap();
         assert_eq!(q.freshness(周六), crate::core::quote::Freshness::Halted);
+    }
+}
+
+#[cfg(test)]
+mod detail_render_tests {
+    use super::render_tests::*;
+    use super::*;
+    use crate::core::bar::Bar;
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+
+    fn fake_bars(n: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| {
+                let c = (i as f64 * 0.25).sin() * 40.0 + 1300.0;
+                Bar {
+                    ts: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+                        + ChronoDuration::days(i as i64),
+                    open: c - 3.0,
+                    high: c + 8.0,
+                    low: c - 8.0,
+                    close: c,
+                    volume: 1000.0,
+                }
+            })
+            .collect()
+    }
+
+    fn detail_app() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Detail;
+        app
+    }
+
+    fn text_of(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> String {
+        (0..h)
+            .map(|y| {
+                let mut out = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let s = buf[(x, y)].symbol();
+                    out.push_str(s);
+                    x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn 详情屏画出蜡烛() {
+        let buf = render_with(140, 40, &detail_app(), &BarState::Ready(fake_bars(200)));
+        let painted = buf.content().iter().filter(|c| {
+            matches!(c.symbol(), "█" | "▀" | "▄" | "│")
+        }).count();
+        assert!(painted > 100, "蜡烛太少，只画了 {painted} 格");
+    }
+
+    #[test]
+    fn 详情屏显示周期与根数() {
+        let buf = render_with(140, 40, &detail_app(), &BarState::Ready(fake_bars(200)));
+        let t = text_of(&buf, 140, 40);
+        assert!(t.contains("日线"), "没显示周期：{t}");
+        assert!(t.contains("200 根"), "没显示根数");
+        assert!(t.contains("MACD"), "没显示指标名");
+    }
+
+    #[test]
+    fn 无数据源与加载中与失败显示不同文案() {
+        let loading = text_of(&render_with(140, 40, &detail_app(), &BarState::Loading), 140, 40);
+        let unsup = text_of(
+            &render_with(140, 40, &detail_app(), &BarState::Unsupported("日股市场的历史 K 线暂无可用免费数据源".into())),
+            140, 40,
+        );
+        let failed = text_of(&render_with(140, 40, &detail_app(), &BarState::Failed("超时".into())), 140, 40);
+        assert!(loading.contains("正在加载"), "加载中文案缺失");
+        assert!(unsup.contains("暂无可用免费数据源"), "缺源文案缺失 —— 这条必须让用户看见");
+        assert!(failed.contains("加载失败"), "失败文案缺失");
+        assert_ne!(loading, unsup);
+        assert_ne!(unsup, failed);
+    }
+
+    #[test]
+    fn 详情屏底栏提示与列表屏不同() {
+        let list = text_of(&render_at(140, 40), 140, 40);
+        let det = text_of(&render_with(140, 40, &detail_app(), &BarState::Ready(fake_bars(60))), 140, 40);
+        assert!(list.contains("Enter 详情"));
+        assert!(det.contains("切周期"));
+    }
+
+    #[test]
+    fn 切到kdj后指标名跟着变() {
+        let mut app = detail_app();
+        app.indicator = crate::ui::detail::IndicatorKind::Kdj;
+        let t = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(120))), 140, 40);
+        assert!(t.contains("KDJ"), "指标名没跟着切换");
+    }
+
+    #[test]
+    fn 详情屏各尺寸都不panic() {
+        for (w, h) in [(40u16, 24u16), (80, 24), (120, 40), (240, 70)] {
+            let _ = render_with(w, h, &detail_app(), &BarState::Ready(fake_bars(300)));
+        }
+    }
+
+    #[test]
+    fn 详情屏每行宽度仍等于终端宽度() {
+        let (w, h) = (140u16, 40u16);
+        let buf = render_with(w, h, &detail_app(), &BarState::Ready(fake_bars(200)));
+        for y in 0..h {
+            let mut width = 0usize;
+            let mut x = 0u16;
+            while x < w {
+                let s = buf[(x, y)].symbol();
+                let sw = unicode_width::UnicodeWidthStr::width(s).max(1);
+                width += sw;
+                x += sw as u16;
+            }
+            assert_eq!(width, w as usize, "详情屏第 {y} 行宽度 {width} != {w}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn 完整形式直接可用() {
+        assert_eq!(parse_cli_symbol("CN:600519").unwrap().to_string(), "CN:600519");
+        assert_eq!(parse_cli_symbol("HK:00700").unwrap().to_string(), "HK:00700");
+        assert_eq!(parse_cli_symbol("us:aapl").is_err(), true, "市场前缀大小写敏感");
+        assert_eq!(parse_cli_symbol("US:aapl").unwrap().to_string(), "US:AAPL");
+    }
+
+    #[test]
+    fn 裸六位数字按a股处理() {
+        assert_eq!(parse_cli_symbol("600519").unwrap().to_string(), "CN:600519");
+        assert_eq!(parse_cli_symbol("000001").unwrap().to_string(), "CN:000001");
+    }
+
+    #[test]
+    fn 有歧义的简写被拒绝而不是猜() {
+        // 4 位既可能是港股也可能是日股，猜错会静默显示另一只股票
+        for ambiguous in ["7203", "0700", "AAPL", "00700"] {
+            assert!(
+                parse_cli_symbol(ambiguous).is_err(),
+                "{ambiguous:?} 有歧义，应要求写明市场而不是替用户猜"
+            );
+        }
+    }
+
+    #[test]
+    fn 错误信息说清怎么改() {
+        let e = parse_cli_symbol("7203").unwrap_err().to_string();
+        assert!(e.contains("CN:600519") && e.contains("JP:7203"), "错误信息要给出正确写法：{e}");
     }
 }
