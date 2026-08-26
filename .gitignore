@@ -1,0 +1,33 @@
+# secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# node
+node_modules/
+dist/
+.turbo/
+*.tsbuildinfo
+
+# rust
+target/
+
+# cloudflare
+.wrangler/
+.mf/
+
+# local market-data cache (rebuildable, can get large)
+.cache/
+data/*.db
+data/*.parquet
+
+# os / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# scratch probe output
+scripts/out/
