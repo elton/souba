@@ -30,6 +30,8 @@ pub struct App {
     pub indicator: IndicatorKind,
     /// K 线视口：显示哪一段、显示多少根
     pub viewport: Viewport,
+    /// 鼠标在终端里的格子坐标。None = 不在图上（或终端不报鼠标）
+    pub mouse: Option<(u16, u16)>,
     /// 用户改过周期/标的后置位，主循环据此重新拉历史
     pub bars_dirty: bool,
 }
@@ -43,6 +45,7 @@ impl App {
             timeframe: Timeframe::Day,
             indicator: IndicatorKind::Macd,
             viewport: Viewport::default(),
+            mouse: None,
             bars_dirty: false,
         }
     }
@@ -90,7 +93,10 @@ impl App {
         match key.code {
             // 详情里 q 和 Esc 都是返回列表，不是退出程序 ——
             // 在子屏按 q 直接杀掉程序是很讨厌的行为
-            KeyCode::Char('q') | KeyCode::Esc => self.screen = Screen::Watchlist,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = Screen::Watchlist;
+                self.mouse = None;
+            }
 
             // ← → 滚动。周期切换让给 Tab —— 看图时滚动的频率远高于切周期。
             KeyCode::Left | KeyCode::Char('h') => self.viewport.pan_left(bar_count),
@@ -126,6 +132,38 @@ impl App {
                 self.bars_dirty = true;
             }
             _ => {}
+        }
+    }
+}
+
+impl App {
+    /// 鼠标移动。只在详情屏有意义 —— 列表屏没有需要十字光标读数的东西。
+    pub fn on_mouse(&mut self, ev: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        if self.screen != Screen::Detail {
+            self.mouse = None;
+            return;
+        }
+        match ev.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Down(_) => {
+                self.mouse = Some((ev.column, ev.row));
+            }
+            // 滚轮当作缩放 —— 这是看盘软件的通用手势
+            MouseEventKind::ScrollUp => self.mouse = Some((ev.column, ev.row)),
+            MouseEventKind::ScrollDown => self.mouse = Some((ev.column, ev.row)),
+            _ => {}
+        }
+    }
+
+    /// 滚轮缩放，需要知道总根数才能夹紧
+    pub fn on_scroll(&mut self, up: bool, bar_count: usize) {
+        if self.screen != Screen::Detail {
+            return;
+        }
+        if up {
+            self.viewport.zoom_in(bar_count);
+        } else {
+            self.viewport.zoom_out(bar_count);
         }
     }
 }

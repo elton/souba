@@ -56,6 +56,49 @@ pub struct DetailView<'a> {
     pub viewport: Viewport,
     /// 当前绘图后端的名字，显示在标题里
     pub surface_label: &'static str,
+    /// 鼠标格子坐标，用来画十字光标
+    pub mouse: Option<(u16, u16)>,
+}
+
+/// 鼠标落点换算出的读数
+struct Hover {
+    bar: Bar,
+    /// 在可视窗口里的下标
+    index: usize,
+    /// 鼠标那一行对应的价格
+    price: f64,
+    /// 画布内的像素行
+    canvas_y: u32,
+}
+
+/// 把鼠标的格子坐标换算成「第几根 K 线 / 什么价位」。
+/// 落在图外返回 None —— 不能让十字光标停在上一次的位置上骗人。
+fn hover_at(
+    mouse: Option<(u16, u16)>,
+    plot: Rect,
+    window: &[Bar],
+    vs: paint::VScale,
+) -> Option<Hover> {
+    let (mx, my) = mouse?;
+    if window.is_empty()
+        || plot.width == 0
+        || plot.height == 0
+        || mx < plot.x
+        || my < plot.y
+        || mx >= plot.x + plot.width
+        || my >= plot.y + plot.height
+    {
+        return None;
+    }
+    let fx = (mx - plot.x) as f64 / (plot.width.max(2) - 1) as f64;
+    let index = ((fx * (window.len() - 1) as f64).round() as usize).min(window.len() - 1);
+    let fy = (my - plot.y) as f64 / (plot.height.max(2) - 1) as f64;
+    Some(Hover {
+        bar: window[index],
+        index,
+        price: vs.max - (vs.max - vs.min) * fy,
+        canvas_y: (fy * (vs.h.max(1) - 1) as f64).round() as u32,
+    })
 }
 
 pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surface) {
@@ -86,14 +129,15 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     } else {
         format!("←{} 根前", bars.len() - hi)
     };
-    let chart_block = Block::default().borders(Borders::ALL).title(format!(
+    let base_title = format!(
         " {} · {} 根 / 共 {} · {} · {} ",
         v.timeframe.label(),
         window.len(),
         bars.len(),
         pos,
         v.surface_label
-    ));
+    );
+    let chart_block = Block::default().borders(Borders::ALL).title(base_title);
     let inner = chart_block.inner(chart_area);
     frame.render_widget(chart_block, chart_area);
 
@@ -117,13 +161,63 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
         h_lines: price_levels,
     };
 
+    // 先按画布高度算一版 VScale 用于命中测试；绘制时 candles 会算出同样的值
+    let probe_h = surface.backend.canvas_size(plot).1;
+    let probe_vs = paint::vscale_of(window, probe_h);
+    let hover = probe_vs.and_then(|vs| hover_at(v.mouse, plot, window, vs));
+    let hover_idx = hover.as_ref().map(|h| (h.index, h.canvas_y));
+
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
         vscale = paint::candles(c, window, Some(&g));
+        if let Some((idx, cy)) = hover_idx {
+            paint::crosshair(c, idx, window.len(), cy);
+        }
     });
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
+        if let Some(h) = &hover {
+            // 光标那一行的价格，压在刻度上方显示
+            let y = plot.y + (h.canvas_y as f64 / (vs.h.max(1) - 1) as f64
+                * (plot.height.max(2) - 1) as f64).round() as u16;
+            let txt = format!("{:.2}", h.price);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    txt.clone(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(axis.x + 1, y.min(axis.y + axis.height - 1),
+                          (txt.chars().count() as u16).min(axis.width.saturating_sub(1)), 1),
+            );
+        }
     }
+    // 悬停时把那根 K 线的 OHLC 显示在图表顶部 —— 光有十字线不知道读的是什么
+    if let Some(h) = &hover {
+        let tz = v.symbol.market.timezone();
+        let when = h.bar.ts.with_timezone(&tz);
+        let fmt = if matches!(v.timeframe, Timeframe::Day | Timeframe::Week | Timeframe::Month) {
+            when.format("%Y-%m-%d").to_string()
+        } else {
+            when.format("%m-%d %H:%M").to_string()
+        };
+        let up = h.bar.close >= h.bar.open;
+        let color = if up { Color::Red } else { Color::Green };
+        let line = Line::from(vec![
+            Span::styled(format!(" {fmt} "), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(
+                    "开 {:.2}  高 {:.2}  低 {:.2}  收 {:.2}",
+                    h.bar.open, h.bar.high, h.bar.low, h.bar.close
+                ),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y, inner.width, 1));
+    }
+
     if time_h > 0 {
         render_time_axis(
             frame,
@@ -380,6 +474,7 @@ mod axis_tests {
                     bars: &state,
                     viewport: vp,
                     surface_label: backend.label(),
+                    mouse: None,
                 },
                 &mut surface,
             )
@@ -526,5 +621,137 @@ mod axis_tests {
     fn 盲文后端下标题标明后端() {
         let t = text(&draw(140, 40, 300), 140, 40);
         assert!(t.contains("盲文"), "标题应标明当前后端");
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use crate::core::bar::Bar;
+    use chrono::{TimeZone, Utc};
+
+    fn bars(n: usize) -> Vec<Bar> {
+        (0..n)
+            .map(|i| Bar {
+                ts: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+                    + chrono::Duration::days(i as i64),
+                open: 100.0 + i as f64,
+                high: 110.0 + i as f64,
+                low: 90.0 + i as f64,
+                close: 105.0 + i as f64,
+                volume: 1.0,
+            })
+            .collect()
+    }
+
+    fn plot() -> Rect {
+        Rect::new(10, 5, 100, 40)
+    }
+
+    fn vs(b: &[Bar]) -> paint::VScale {
+        paint::vscale_of(b, 400).unwrap()
+    }
+
+    #[test]
+    fn 鼠标在图外返回none() {
+        let b = bars(50);
+        let p = plot();
+        for pos in [(0u16, 0u16), (9, 20), (200, 20), (50, 4), (50, 100)] {
+            assert!(
+                hover_at(Some(pos), p, &b, vs(&b)).is_none(),
+                "{pos:?} 在图外，不该产生读数"
+            );
+        }
+    }
+
+    #[test]
+    fn 没有鼠标时返回none() {
+        let b = bars(50);
+        assert!(hover_at(None, plot(), &b, vs(&b)).is_none());
+    }
+
+    #[test]
+    fn 左边缘命中第一根右边缘命中最后一根() {
+        let b = bars(50);
+        let p = plot();
+        let left = hover_at(Some((p.x, p.y + 10)), p, &b, vs(&b)).unwrap();
+        assert_eq!(left.index, 0);
+        let right = hover_at(Some((p.x + p.width - 1, p.y + 10)), p, &b, vs(&b)).unwrap();
+        assert_eq!(right.index, b.len() - 1);
+    }
+
+    #[test]
+    fn 命中的是鼠标下方那根的真实数据() {
+        let b = bars(50);
+        let p = plot();
+        let h = hover_at(Some((p.x + p.width / 2, p.y + 10)), p, &b, vs(&b)).unwrap();
+        assert_eq!(h.bar.close, b[h.index].close, "读数必须来自命中的那一根");
+    }
+
+    #[test]
+    fn 顶部读到高价底部读到低价() {
+        let b = bars(50);
+        let p = plot();
+        let top = hover_at(Some((p.x + 5, p.y)), p, &b, vs(&b)).unwrap();
+        let bottom = hover_at(Some((p.x + 5, p.y + p.height - 1)), p, &b, vs(&b)).unwrap();
+        assert!(top.price > bottom.price, "上方价格应更高");
+        let scale = vs(&b);
+        assert!((top.price - scale.max).abs() < 1.0, "顶部应贴近区间上沿");
+        assert!((bottom.price - scale.min).abs() < 1.0, "底部应贴近区间下沿");
+    }
+
+    #[test]
+    fn 空数据不panic() {
+        assert!(hover_at(Some((20, 10)), plot(), &[], paint::VScale::new(0.0, 1.0, 10)).is_none());
+    }
+
+    #[test]
+    fn 极小面板不panic() {
+        let b = bars(3);
+        for p in [Rect::new(0, 0, 1, 1), Rect::new(0, 0, 2, 1), Rect::new(0, 0, 1, 2)] {
+            let _ = hover_at(Some((0, 0)), p, &b, vs(&b));
+        }
+    }
+
+    #[test]
+    fn 悬停时标题栏显示ohlc() {
+        let b = bars(300);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        let sym = crate::core::symbol::Symbol::parse("CN:600519").unwrap();
+        let state = BarState::Ready(b);
+        let mut surface = Surface::new(crate::ui::surface::Backend::Braille);
+        term.draw(|f| {
+            render(
+                f,
+                Rect::new(0, 0, 160, 40),
+                &DetailView {
+                    symbol: &sym,
+                    quote: None,
+                    timeframe: Timeframe::Day,
+                    indicator: IndicatorKind::Macd,
+                    bars: &state,
+                    viewport: Viewport::default(),
+                    surface_label: "盲文",
+                    mouse: Some((60, 12)),
+                },
+                &mut surface,
+            )
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let t: String = (0..40u16)
+            .map(|y| {
+                let mut out = String::new();
+                let mut x = 0u16;
+                while x < 160 {
+                    let s = buf[(x, y)].symbol();
+                    out.push_str(s);
+                    x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(t.contains("开 ") && t.contains("收 "), "悬停应显示 OHLC 读数");
     }
 }
