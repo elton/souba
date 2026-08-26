@@ -299,6 +299,23 @@ pub fn clear() -> String {
 /// 目前只有主图和指标两个面板，留些余量
 pub const MAX_SLOTS: u32 = 4;
 
+/// 开启鼠标上报。
+///
+/// 这个序列是**实测出来的**，不是照文档推的。三个组合都试过：
+///
+/// | 序列 | 结果 |
+/// |---|---|
+/// | `1000+1002+1015+1006` 再加 `1003`（crossterm 的 EnableMouseCapture + 补 1003） | 只有点击，无移动 |
+/// | `1000+1003+1006`（只开需要的） | **一个事件都没有** |
+/// | `1000+1002+1003+1006`（不含 1015） | ✅ 移动、点击都正常 |
+///
+/// 两个教训：`?1015`(urxvt 编码)和 `?1006`(SGR 编码)会打架，必须只留 SGR；
+/// 而 `?1002` 不能省 —— 单开 `?1003` 在 otty 上不上报任何东西。
+///
+/// **所以不能用 crossterm 的 `EnableMouseCapture`** —— 它固定带 `?1015`。
+pub const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
 pub fn emit(s: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout();
     out.write_all(s.as_bytes())?;

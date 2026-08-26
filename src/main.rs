@@ -133,16 +133,10 @@ async fn main() -> anyhow::Result<()> {
 
     let backend = Backend::detect();
     let mut terminal = ratatui::init();
-    // 开启鼠标捕获才能画十字光标。代价是鼠标框选文字要按住 Shift ——
-    // 这是所有全屏 TUI 的通例。
-    // crossterm 的 EnableMouseCapture 只开 ?1000(按下)和 ?1002(拖动)，
-    // 不开 ?1003(任意移动) —— 不补这一句就只有点击才有十字光标。
-    let mouse_ok = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::EnableMouseCapture
-    )
-    .is_ok()
-        && crate::ui::kitty::emit("\x1b[?1003h").is_ok();
+    // 开启鼠标上报才能画十字光标。代价是鼠标框选文字要按住 Shift ——
+    // 这是所有全屏 TUI 的通例。具体开哪几个模式、为什么不用 crossterm
+    // 的 EnableMouseCapture，见 kitty::MOUSE_ON 的注释。
+    let mouse_ok = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_ON).is_ok();
     let mut app = App::new();
     if let Some(d) = &direct {
         app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
@@ -160,11 +154,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
     if mouse_ok {
-        let _ = crate::ui::kitty::emit("\x1b[?1003l");
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableMouseCapture
-        );
+        let _ = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_OFF);
     }
     // 退出前删掉贴过的位图，否则会残留在滚动缓冲里
     if matches!(backend, Backend::Kitty(_)) {
@@ -221,21 +211,30 @@ async fn run(
             last_stamp = stamp;
         }
 
+        // 任意移动模式的事件量很大（实测晃 15 秒能产生上万个），
+        // 一轮循环只处理一个会越积越多、光标跟不上手。
+        // 所以先阻塞等第一个，再把已排队的一次性排空，然后只画一帧。
         if event::poll(Duration::from_millis(100))? {
             let bars_now = bar_len(&bar_state);
-            match event::read()? {
-                Event::Key(k) => app.on_key_with(k, watch.len(), bars_now),
-                Event::Mouse(m) => {
-                    use crossterm::event::MouseEventKind;
-                    app.on_mouse(m);
-                    // 滚轮缩放是看盘软件的通用手势
-                    match m.kind {
-                        MouseEventKind::ScrollUp => app.on_scroll(true, bars_now),
-                        MouseEventKind::ScrollDown => app.on_scroll(false, bars_now),
-                        _ => {}
+            loop {
+                match event::read()? {
+                    Event::Key(k) => app.on_key_with(k, watch.len(), bars_now),
+                    Event::Mouse(m) => {
+                        use crossterm::event::MouseEventKind;
+                        app.on_mouse(m);
+                        // 滚轮缩放是看盘软件的通用手势
+                        match m.kind {
+                            MouseEventKind::ScrollUp => app.on_scroll(true, bars_now),
+                            MouseEventKind::ScrollDown => app.on_scroll(false, bars_now),
+                            _ => {}
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                // 零超时 poll = 「还有没有已经到了的事件」
+                if app.should_quit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
     }
