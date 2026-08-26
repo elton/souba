@@ -205,3 +205,145 @@ mod tests {
         assert!(parse_batch(b"").is_empty());
     }
 }
+
+// ───────────────────────────────── HTTP 客户端 ─────────────────────────────────
+
+use std::time::Duration;
+
+use crate::source::QuoteSource;
+use crate::source::throttle::Throttle;
+
+/// 腾讯实测上限：一次请求最多 100 只，请求更多会静默返回前 100
+const MAX_PER_REQUEST: usize = 100;
+/// A股 Level-1 本身是 3 秒快照，比这更快没有意义
+const MIN_INTERVAL: Duration = Duration::from_secs(3);
+
+pub(crate) fn chunk_symbols(symbols: &[Symbol]) -> Vec<&[Symbol]> {
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    symbols.chunks(MAX_PER_REQUEST).collect()
+}
+
+pub(crate) fn query_param(symbols: &[Symbol]) -> String {
+    symbols
+        .iter()
+        .map(Symbol::to_tencent)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub struct TencentSource {
+    http: reqwest::Client,
+    throttle: Throttle,
+}
+
+impl TencentSource {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .user_agent("souba/0.1")
+                .build()?,
+            throttle: Throttle::new(MIN_INTERVAL),
+        })
+    }
+}
+
+impl QuoteSource for TencentSource {
+    fn id(&self) -> &'static str {
+        SOURCE_ID
+    }
+
+    async fn quotes(&self, symbols: &[Symbol]) -> anyhow::Result<Vec<Quote>> {
+        let mut out = Vec::with_capacity(symbols.len());
+        for chunk in chunk_symbols(symbols) {
+            self.throttle.acquire().await;
+            let url = format!("https://qt.gtimg.cn/q={}", query_param(chunk));
+            let res = match self.http.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.throttle.penalize();
+                    return Err(e.into());
+                }
+            };
+            if !res.status().is_success() {
+                self.throttle.penalize();
+                anyhow::bail!("腾讯返回 {}", res.status());
+            }
+            let bytes = res.bytes().await?;
+            self.throttle.reset();
+            // 单只解析失败不影响同批其他标的
+            for r in parse_batch(&bytes) {
+                match r {
+                    Ok(q) => out.push(q),
+                    // 阶段 1 还没引入日志框架，先打到 stderr。引入 tracing 时替换。
+                    Err(e) => eprintln!("[souba] 解析单条报价失败：{e}"),
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    fn syms(n: usize) -> Vec<Symbol> {
+        (0..n)
+            .map(|i| Symbol::parse(&format!("CN:{:06}", 600000 + i)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn 不足一百只不分片() {
+        let s = syms(30);
+        assert_eq!(chunk_symbols(&s).len(), 1);
+    }
+
+    #[test]
+    fn 正好一百只不分片() {
+        let s = syms(100);
+        assert_eq!(chunk_symbols(&s).len(), 1);
+    }
+
+    #[test]
+    fn 超过一百只按百分片() {
+        // 腾讯实测上限 100 只/请求，请求 300 只只静默返回前 100
+        // 注意要先绑定 —— chunk_symbols 返回的切片借用入参，不能借临时值
+        let s = syms(250);
+        let chunks = chunk_symbols(&s);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 100);
+        assert_eq!(chunks[2].len(), 50);
+    }
+
+    #[test]
+    fn 空列表不产生请求() {
+        assert!(chunk_symbols(&[]).is_empty());
+    }
+
+    #[test]
+    fn 查询串用逗号连接腾讯代码() {
+        let s = vec![
+            Symbol::parse("CN:600519").unwrap(),
+            Symbol::parse("HK:00700").unwrap(),
+        ];
+        assert_eq!(query_param(&s), "sh600519,r_hk00700");
+    }
+
+    #[tokio::test]
+    #[ignore = "需要联网，用 cargo test -- --ignored 单独跑"]
+    async fn 联网拉真实报价() {
+        let src = TencentSource::new().unwrap();
+        let syms = vec![
+            Symbol::parse("CN:600519").unwrap(),
+            Symbol::parse("HK:00700").unwrap(),
+        ];
+        let quotes = src.quotes(&syms).await.unwrap();
+        assert_eq!(quotes.len(), 2);
+        assert!(!quotes[0].name.is_empty());
+        assert!(quotes[0].last > Decimal::ZERO);
+    }
+}
