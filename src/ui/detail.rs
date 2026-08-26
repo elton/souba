@@ -170,10 +170,12 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
         vscale = paint::candles(c, window, Some(&g));
-        if let Some((idx, cy)) = hover_idx {
-            paint::crosshair(c, idx, window.len(), cy);
-        }
     });
+    // 十字光标用终端字符画在文字层，位图在 z=-1 之下 ——
+    // 这样鼠标一动只重画几个字符，不用重发那张几十 MB 的位图。
+    if hover_idx.is_some() {
+        render_crosshair(frame, plot, v.mouse);
+    }
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
         if let Some(h) = &hover {
@@ -263,6 +265,33 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
             surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k, &tick_idx));
         }
     }
+}
+
+/// 十字光标。用终端字符而不是画进位图 —— 位图每帧几十 MB，
+/// 鼠标一动就重发会直接卡死；字符层重画几十个格子是零成本。
+///
+/// 代价是精度只到字符格，但十字线本来就是读数辅助不是数据，够用。
+fn render_crosshair(frame: &mut Frame, plot: Rect, mouse: Option<(u16, u16)>) {
+    let Some((mx, my)) = mouse else { return };
+    let style = Style::default().fg(Color::Gray);
+    let buf = frame.buffer_mut();
+    for x in plot.x..(plot.x + plot.width) {
+        if x == mx {
+            continue;
+        }
+        buf[(x, my)].set_char('─').set_style(style);
+    }
+    for y in plot.y..(plot.y + plot.height) {
+        if y == my {
+            continue;
+        }
+        buf[(mx, y)].set_char('│').set_style(style);
+    }
+    buf[(mx, my)].set_char('┼').set_style(
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 /// 横轴时间刻度。标签左边缘对齐所标的那根 K 线，最后一个右对齐

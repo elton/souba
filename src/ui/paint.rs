@@ -16,9 +16,6 @@ pub const LINE_C: Rgb = Rgb(200, 90, 220);
 pub const AXIS: Rgb = Rgb(90, 90, 90);
 /// 网格线。要能看见但不能抢眼 —— 它是背景参考，不是内容。
 pub const GRID: Rgb = Rgb(70, 76, 88);
-/// 十字光标。比网格亮一档，因为它是用户正在看的东西；
-/// 但仍比蜡烛暗，不能喧宾夺主。
-pub const CROSS: Rgb = Rgb(150, 158, 172);
 
 /// 网格规格。横线按价格刻度的档位走，竖线贴在时间刻度上，
 /// 这样网格和坐标轴数字是对齐的 —— 不对齐的网格只会添乱。
@@ -162,29 +159,6 @@ pub fn candles(c: &mut Canvas, bars: &[Bar], g: Option<&Grid>) -> Option<VScale>
         c.fill_rect(x, yt as i64, body_w as i64, h, color);
     }
     Some(vs)
-}
-
-/// 十字光标。画在蜡烛**之上**（它是叠加的读数辅助，不是背景），
-/// 用比网格更密的虚线以示区别。
-pub fn crosshair(c: &mut Canvas, bar_index: usize, bar_count: usize, y: u32) {
-    if c.w == 0 || c.h == 0 {
-        return;
-    }
-    // 每 3 像素画 2 个 —— 比网格(4 取 2)密，视觉上更"实"，一眼能分开
-    for x in 0..c.w {
-        if x % 3 < 2 {
-            c.blend(x as i64, y as i64, CROSS, 0.75);
-        }
-    }
-    if bar_count > 0 && bar_index < bar_count {
-        let (step, body) = layout(c.w, bar_count);
-        let x = (bar_index as f64 * step + body as f64 / 2.0).round() as i64;
-        for yy in 0..c.h {
-            if yy % 3 < 2 {
-                c.blend(x, yy as i64, CROSS, 0.75);
-            }
-        }
-    }
 }
 
 /// 把一条序列画成折线，与蜡烛用同一套横坐标。

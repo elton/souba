@@ -18,6 +18,10 @@ use crate::ui::braille::Braille;
 use crate::ui::canvas::{Canvas, Rgb};
 use crate::ui::kitty::{self, CellPixels};
 
+/// 单张图的像素上限。约 1080p 的两倍，对 K 线来说远超肉眼分辨极限，
+/// 但把压缩耗时压在可接受范围内。
+const MAX_PIXELS: u64 = 4_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// 真·位图。画质与 GUI 无异。
@@ -46,13 +50,27 @@ impl Backend {
         }
     }
 
-    /// 给定字符格区域，该开多大的像素画布
+    /// 给定字符格区域，该开多大的像素画布。
+    ///
+    /// 位图后端会按 `MAX_PIXELS` 封顶再等比缩小 —— 终端会把图拉伸回目标格数，
+    /// 少量软化肉眼看不出，但压缩耗时是按像素数线性增长的，不封顶会卡。
     pub fn canvas_size(self, area: Rect) -> (u32, u32) {
         match self {
-            Backend::Kitty(cp) => (
-                area.width as u32 * cp.w as u32,
-                area.height as u32 * cp.h as u32,
-            ),
+            Backend::Kitty(cp) => {
+                let (w, h) = (
+                    area.width as u32 * cp.w as u32,
+                    area.height as u32 * cp.h as u32,
+                );
+                let total = w as u64 * h as u64;
+                if total <= MAX_PIXELS {
+                    return (w.max(1), h.max(1));
+                }
+                let k = (MAX_PIXELS as f64 / total as f64).sqrt();
+                (
+                    ((w as f64 * k) as u32).max(1),
+                    ((h as f64 * k) as u32).max(1),
+                )
+            }
             Backend::Braille => (area.width as u32 * 2, area.height as u32 * 4),
         }
     }
@@ -172,6 +190,33 @@ mod tests {
         let area = Rect::new(0, 0, 10, 5);
         let b = Backend::Kitty(CellPixels { w: 9, h: 18 });
         assert_eq!(b.canvas_size(area), (90, 90));
+    }
+
+    #[test]
+    fn 超大区域按像素上限缩小() {
+        // 实测 otty 每格 19x38，219x44 格 = 696 万像素，超过上限
+        let area = Rect::new(0, 0, 219, 44);
+        let (w, h) = Backend::Kitty(CellPixels { w: 19, h: 38 }).canvas_size(area);
+        let total = w as u64 * h as u64;
+        assert!(total <= MAX_PIXELS, "{w}x{h} = {total} 超过上限");
+        // 等比缩放，宽高比不能变形
+        let want = 219.0 * 19.0 / (44.0 * 38.0);
+        let got = w as f64 / h as f64;
+        assert!((want - got).abs() / want < 0.02, "宽高比变形了：{want:.3} vs {got:.3}");
+    }
+
+    #[test]
+    fn 未超上限时不缩小保持原生清晰度() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (w, h) = Backend::Kitty(CellPixels { w: 10, h: 20 }).canvas_size(area);
+        assert_eq!((w, h), (800, 480), "没超上限就不该动");
+    }
+
+    #[test]
+    fn 缩小后仍不为零() {
+        let area = Rect::new(0, 0, 2000, 2000);
+        let (w, h) = Backend::Kitty(CellPixels { w: 20, h: 40 }).canvas_size(area);
+        assert!(w > 0 && h > 0);
     }
 
     #[test]

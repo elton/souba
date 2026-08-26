@@ -6,6 +6,11 @@
 //!
 //! 协议要点（`ESC _ G <控制字段> ; <base64 载荷> ESC \`）：
 //! - `a=T` 传输并显示，`f=32` 载荷是 RGBA
+//! - `o=z` 载荷用 zlib 压缩。**这个是必需的不是优化** —— 一屏 K 线的
+//!   原始 RGBA 有 26MB，base64 后 35MB，每帧发一次会直接卡死；
+//!   而 K 线图大片是纯背景，实测压缩 74 倍到 491KB。
+//! - `z=-1` 把图像放到**文字层之下**。这样十字光标可以用终端字符画，
+//!   鼠标一动只重画几个字符，完全不用重发位图。
 //! - `s`/`v` 是图像像素宽高，`c`/`r` 是占用的字符格数
 //! - `i=<id>` 固定图像 id，重发即替换，避免堆积
 //! - `q=2` 让终端别回响应，否则响应会串进 stdin 被当成按键
@@ -228,9 +233,28 @@ fn b64(data: &[u8]) -> String {
 /// 生成把画布贴到 (col,row) 的完整转义序列。
 ///
 /// 单独抽成纯函数是为了能测 —— 直接写 stdout 没法断言。
+/// 图像的层级。负数表示画在文字之下 —— 十字光标、坐标刻度这些用字符画的
+/// 东西才能叠在图上，而不需要把它们也栅格化进位图。
+const Z_INDEX: i32 = -1;
+
+/// zlib 压缩等级。1 而不是 6：实测 level 1 压 74 倍耗时 161ms，
+/// level 6 压 264 倍要 425ms —— 多花的 264ms 换来的体积差在这里没有意义，
+/// 反正都远小于终端的吞吐瓶颈。
+const ZLIB_LEVEL: u32 = 1;
+
+fn deflate(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(ZLIB_LEVEL));
+    // 压缩失败时退回原始数据 —— 慢总好过不显示
+    if e.write_all(raw).is_err() {
+        return raw.to_vec();
+    }
+    e.finish().unwrap_or_else(|_| raw.to_vec())
+}
+
 pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16, slot: u32) -> String {
     let id = IMAGE_ID_BASE + slot;
-    let payload = b64(canvas.rgba());
+    let payload = b64(&deflate(canvas.rgba()));
     let mut out = String::with_capacity(payload.len() + 256);
     // 先删掉这个 slot 上一帧的放置，否则新旧会叠在一起
     out.push_str(&clear_slot(slot));
@@ -249,7 +273,7 @@ pub fn encode(canvas: &Canvas, col: u16, row: u16, cols: u16, rows: u16, slot: u
         let more = u8::from(i + 1 < chunks.len());
         if i == 0 {
             out.push_str(&format!(
-                "\x1b_Ga=T,f=32,t=d,i={id},s={},v={},c={cols},r={rows},C=1,q=2,m={more};{ch}\x1b\\",
+                "\x1b_Ga=T,f=32,o=z,t=d,i={id},s={},v={},c={cols},r={rows},z={Z_INDEX},C=1,q=2,m={more};{ch}\x1b\\",
                 canvas.w, canvas.h
             ));
         } else {
@@ -342,8 +366,22 @@ mod tests {
 
     #[test]
     fn 大图分块且最后一块标记结束() {
-        // 4096 base64 字符对应 3072 字节 = 768 个像素，取远超这个的尺寸
-        let c = Canvas::new(200, 200);
+        // 载荷现在会压缩，空白画布压完只剩几百字节不会分块。
+        // 用伪随机噪声填满，压不动，才能测到分块逻辑。
+        let mut c = Canvas::new(400, 400);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for y in 0..400 {
+            for x in 0..400 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                c.set(
+                    x,
+                    y,
+                    Rgb(seed as u8, (seed >> 8) as u8, (seed >> 16) as u8),
+                );
+            }
+        }
         let s = encode(&c, 0, 0, 20, 10, 0);
         assert!(s.contains("m=1;"), "大图应分块，缺少 m=1");
         assert!(s.contains("m=0;"), "最后一块应标记 m=0");
@@ -443,6 +481,39 @@ mod tests {
         for bad in [&b"\x1b[6;38t"[..], b"\x1b[6;t", b"\x1b[", b"\x1b[6;abc;def t"] {
             let _ = parse_csi_t(bad, b'6');
         }
+    }
+
+    #[test]
+    fn 载荷必须压缩且体积可控() {
+        // 不压缩的话一屏 K 线是 35MB，每帧发一次直接卡死。
+        // 这个测试守住那条线，别哪天把 o=z 去掉了没人发现。
+        let cp = CellPixels { w: 19, h: 38 };
+        let (cols, rows) = (219u16, 44u16);
+        let mut c = Canvas::new(1600, 900);
+        c.fill_rect(0, 0, 1600, 900, Rgb(40, 44, 52));
+        for i in 0..250 {
+            let x = i * 6;
+            let y = 300 + ((i as f64 * 0.3).sin() * 200.0) as i64;
+            c.fill_rect(x, y, 4, 90, Rgb(220, 60, 60));
+        }
+        let s = encode(&c, 0, 0, cols, rows, 0);
+        assert!(s.contains("o=z"), "载荷没有声明 zlib 压缩");
+        let raw_b64 = c.rgba().len() * 4 / 3;
+        assert!(
+            s.len() * 8 < raw_b64,
+            "压缩后 {} 字节，相比未压缩的 {raw_b64} 至少要小一个数量级",
+            s.len()
+        );
+        let _ = cp;
+    }
+
+    #[test]
+    fn 图像放在文字层之下() {
+        // z 为负数才能让十字光标、坐标刻度用字符画在图上面。
+        // 这是性能设计的关键：鼠标移动只重画字符，不重发位图。
+        let c = Canvas::new(8, 8);
+        let s = encode(&c, 0, 0, 1, 1, 0);
+        assert!(s.contains("z=-1"), "缺少负 z-index，字符会被图盖住");
     }
 
     #[test]

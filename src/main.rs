@@ -135,11 +135,14 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // 开启鼠标捕获才能画十字光标。代价是鼠标框选文字要按住 Shift ——
     // 这是所有全屏 TUI 的通例。
+    // crossterm 的 EnableMouseCapture 只开 ?1000(按下)和 ?1002(拖动)，
+    // 不开 ?1003(任意移动) —— 不补这一句就只有点击才有十字光标。
     let mouse_ok = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture
     )
-    .is_ok();
+    .is_ok()
+        && crate::ui::kitty::emit("\x1b[?1003h").is_ok();
     let mut app = App::new();
     if let Some(d) = &direct {
         app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
@@ -157,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
     if mouse_ok {
+        let _ = crate::ui::kitty::emit("\x1b[?1003l");
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture
@@ -181,11 +185,11 @@ async fn run(
 ) -> anyhow::Result<()> {
     // 十字光标随鼠标动，所以鼠标位置也要纳入重绘判定 —— 否则位图不会刷新
     type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind,
-                  crate::ui::viewport::Viewport, Option<(u16, u16)>, (u16, u16), usize);
+                  crate::ui::viewport::Viewport, (u16, u16), usize);
     let mut last_stamp: Stamp = (Screen::Watchlist, usize::MAX, Timeframe::Day,
                                  crate::ui::detail::IndicatorKind::Macd,
                                  crate::ui::viewport::Viewport { span: 0, offset: usize::MAX },
-                                 None, (0, 0), usize::MAX);
+                                 (0, 0), usize::MAX);
     while !app.should_quit {
         if app.bars_dirty {
             app.bars_dirty = false;
@@ -201,7 +205,9 @@ async fn run(
         terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state, &mut surface))?;
         // 位图叠在字符层之上，必须在 ratatui 画完之后才发。
         // ratatui 只重绘变化的格子，所以图不会被每帧擦掉 —— 但内容变了要重发。
-        let stamp = (app.screen, app.selected, app.timeframe, app.indicator, app.viewport, app.mouse,
+        // 注意：**不含鼠标位置**。十字光标走字符层，鼠标移动不该触发位图重发 ——
+        // 那张图压缩后还有几百 KB，每帧发一次会卡。
+        let stamp = (app.screen, app.selected, app.timeframe, app.indicator, app.viewport,
                      terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
                      bar_len(&bar_state));
         if let Some(seq) = surface.escape.take() {
