@@ -4,9 +4,24 @@
 
 `相場（そうば）` 是日语「行情、市价」。这个项目就是一个行情终端 —— 打开终端就能看到自选股实时跳动，跑策略选股，问 AI 要建议。
 
-**状态：设计已定稿，尚未开始实现。**
-设计方案见 [`docs/decisions/2026-08-26-souba-设计.md`](docs/decisions/2026-08-26-souba-设计.md)，
-支撑它的实测调研见 [`docs/research/`](docs/research/)。
+**状态：阶段 1 完成 —— 能看盘了。**
+
+```sh
+cargo run --release          # 或 ./target/release/souba
+```
+
+自选股实时行情已可用，四个市场的代码都能加。设计方案见
+[`docs/decisions/2026-08-26-souba-设计.md`](docs/decisions/2026-08-26-souba-设计.md)，
+实施计划见 [`docs/plans/`](docs/plans/)，支撑它们的实测调研见 [`docs/research/`](docs/research/)。
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 0 | Cloudflare Worker 出口可达性验证 | ✅ 全部打通，无封禁 |
+| 1 | 四市场报价 + 自选股 + 自适应 TUI | ✅ |
+| 2 | 指标引擎 + K 线渲染 + 搜索/增删自选股 | 未开始 |
+| 3 | 降级链（新浪备源、日股 Yahoo 爬取） | 未开始 |
+| 4 | D1 历史累积 + 策略引擎 + Vegas | 未开始 |
+| 5 | AI 推荐 | 未开始 |
 
 ---
 
