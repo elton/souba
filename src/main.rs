@@ -21,6 +21,7 @@ use crate::source::history::{HistoryClient, HistoryError};
 use crate::source::tencent::TencentSource;
 use crate::store::Store;
 use crate::ui::detail::{BarState, DetailView};
+use crate::ui::surface::{Backend, Surface};
 use crate::ui::layout::{Breakpoint, MIN_HEIGHT, MIN_WIDTH, split};
 use crate::ui::watchlist::{ColumnKey, columns_for, freshness_label, truncate_display};
 use crate::ui::{App, Screen};
@@ -130,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let backend = Backend::detect();
     let mut terminal = ratatui::init();
     let mut app = App::new();
     if let Some(d) = &direct {
@@ -144,8 +146,13 @@ async fn main() -> anyhow::Result<()> {
         &mut qrx,
         &req_tx,
         &mut bar_rx,
+        backend,
     )
     .await;
+    // 退出前删掉贴过的位图，否则会残留在滚动缓冲里
+    if matches!(backend, Backend::Kitty(_)) {
+        let _ = crate::ui::kitty::emit(&crate::ui::kitty::clear());
+    }
     ratatui::restore();
     result
 }
@@ -157,7 +164,11 @@ async fn run(
     qrx: &mut tokio::sync::watch::Receiver<Vec<Quote>>,
     req_tx: &tokio::sync::mpsc::Sender<BarKey>,
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
+    backend: Backend,
 ) -> anyhow::Result<()> {
+    type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind, (u16, u16), usize);
+    let mut last_stamp: Stamp = (Screen::Watchlist, usize::MAX, Timeframe::Day,
+                                 crate::ui::detail::IndicatorKind::Macd, (0, 0), usize::MAX);
     while !app.should_quit {
         if app.bars_dirty {
             app.bars_dirty = false;
@@ -169,7 +180,23 @@ async fn run(
 
         let quotes = qrx.borrow().clone();
         let (bar_key, bar_state) = bar_rx.borrow().clone();
-        terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state))?;
+        let mut surface = Surface::new(backend);
+        terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state, &mut surface))?;
+        // 位图叠在字符层之上，必须在 ratatui 画完之后才发。
+        // ratatui 只重绘变化的格子，所以图不会被每帧擦掉 —— 但内容变了要重发。
+        let stamp = (app.screen, app.selected, app.timeframe, app.indicator,
+                     terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
+                     bar_len(&bar_state));
+        if let Some(seq) = surface.escape.take() {
+            if stamp != last_stamp {
+                let _ = crate::ui::kitty::emit(&seq);
+                last_stamp = stamp;
+            }
+        } else if matches!(backend, Backend::Kitty(_)) && app.screen != Screen::Detail && last_stamp.0 == Screen::Detail {
+            // 从详情退回列表：清掉残留的图
+            let _ = crate::ui::kitty::emit(&crate::ui::kitty::clear());
+            last_stamp = stamp;
+        }
 
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(k) = event::read()?
@@ -180,6 +207,13 @@ async fn run(
     Ok(())
 }
 
+fn bar_len(s: &BarState) -> usize {
+    match s {
+        BarState::Ready(b) => b.len(),
+        _ => 0,
+    }
+}
+
 fn draw(
     frame: &mut Frame,
     app: &App,
@@ -187,6 +221,7 @@ fn draw(
     quotes: &[Quote],
     bar_key: &Option<BarKey>,
     bar_state: &BarState,
+    surface: &mut Surface,
 ) {
     let area = frame.area();
     let bp = Breakpoint::of(area);
@@ -237,6 +272,7 @@ fn draw(
                         indicator: app.indicator,
                         bars: &state,
                     },
+                    surface,
                 );
             }
             frame.render_widget(
@@ -366,7 +402,8 @@ pub(crate) mod render_tests {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let watch = watch();
         let key = watch.first().map(|s| (s.clone(), app.timeframe));
-        term.draw(|f| draw(f, app, &watch, &sample(), &key, bars))
+        let mut surface = crate::ui::surface::Surface::new(crate::ui::surface::Backend::Braille);
+        term.draw(|f| draw(f, app, &watch, &sample(), &key, bars, &mut surface))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -510,10 +547,18 @@ mod detail_render_tests {
 
     #[test]
     fn 详情屏画出蜡烛() {
+        // 盲文后端产出的是 U+2800 一族，不是旧的半块字符
         let buf = render_with(140, 40, &detail_app(), &BarState::Ready(fake_bars(200)));
-        let painted = buf.content().iter().filter(|c| {
-            matches!(c.symbol(), "█" | "▀" | "▄" | "│")
-        }).count();
+        let painted = buf
+            .content()
+            .iter()
+            .filter(|c| {
+                c.symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch))
+            })
+            .count();
         assert!(painted > 100, "蜡烛太少，只画了 {painted} 格");
     }
 
@@ -590,7 +635,7 @@ mod cli_tests {
     fn 完整形式直接可用() {
         assert_eq!(parse_cli_symbol("CN:600519").unwrap().to_string(), "CN:600519");
         assert_eq!(parse_cli_symbol("HK:00700").unwrap().to_string(), "HK:00700");
-        assert_eq!(parse_cli_symbol("us:aapl").is_err(), true, "市场前缀大小写敏感");
+        assert!(parse_cli_symbol("us:aapl").is_err(), "市场前缀大小写敏感");
         assert_eq!(parse_cli_symbol("US:aapl").unwrap().to_string(), "US:AAPL");
     }
 

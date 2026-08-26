@@ -1,7 +1,10 @@
 //! 盲文点阵画布。
 //!
 //! 每个字符单元是 2×4 个点，所以一块 W×H 的区域有 2W×4H 的作图精度 ——
-//! 纵向是半块字符（`▀▄█`）的 4 倍。指标折线用它才不会看起来像一串跳动的点。
+//! 纵向是半块字符（`▀▄█`）的 4 倍。
+//!
+//! 它只负责「把点阵落成字符」；连线、抗锯齿这些在 `canvas` 里做完，
+//! 这边只是 `surface` 降采样的落地端。
 //!
 //! Unicode 盲文点位到比特的映射（U+2800 + mask）：
 //!
@@ -54,32 +57,6 @@ impl Braille {
         let idx = cy as usize * self.w as usize + cx as usize;
         self.mask[idx] |= DOTS[(sx % 2) as usize][(sy % 4) as usize];
         self.color[idx] = Some(color);
-    }
-
-    /// 两点之间连线（Bresenham），让折线连续而不是散点
-    pub fn line(&mut self, x0: u16, y0: u16, x1: u16, y1: u16, color: Color) {
-        let (mut x, mut y) = (x0 as i32, y0 as i32);
-        let (x1, y1) = (x1 as i32, y1 as i32);
-        let dx = (x1 - x).abs();
-        let dy = -(y1 - y).abs();
-        let sx = if x < x1 { 1 } else { -1 };
-        let sy = if y < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            self.set(x.max(0) as u16, y.max(0) as u16, color);
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = err * 2;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
-        }
     }
 
     /// 把画布刷到终端缓冲区。只写非空单元，不覆盖已有内容之外的地方。
@@ -145,27 +122,6 @@ mod tests {
         b.set(999, 999, Color::White);
         b.set(0, 999, Color::White);
         assert!(b.mask.iter().all(|m| *m == 0));
-    }
-
-    #[test]
-    fn 连线是连续的() {
-        // 斜线跨越多个字符单元，每一列都该有点亮的格子
-        let mut b = Braille::new(8, 4);
-        b.line(0, 0, 15, 15, Color::White);
-        for cx in 0..8u16 {
-            let any = (0..4u16).any(|cy| b.mask[cy as usize * 8 + cx as usize] != 0);
-            assert!(any, "第 {cx} 列没有点 —— 折线断了");
-        }
-    }
-
-    #[test]
-    fn 水平线也连续() {
-        let mut b = Braille::new(6, 2);
-        b.line(0, 4, 11, 4, Color::White);
-        for cx in 0..6u16 {
-            let any = (0..2u16).any(|cy| b.mask[cy as usize * 6 + cx as usize] != 0);
-            assert!(any, "水平线第 {cx} 列断了");
-        }
     }
 
     #[test]

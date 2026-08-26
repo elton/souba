@@ -1,7 +1,10 @@
 pub mod braille;
-pub mod chart;
+pub mod canvas;
 pub mod detail;
+pub mod kitty;
+pub mod surface;
 pub mod layout;
+pub mod paint;
 pub mod watchlist;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};

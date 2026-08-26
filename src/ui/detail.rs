@@ -10,7 +10,8 @@ use crate::core::bar::{Bar, Timeframe};
 use crate::core::indicator::{kdj, macd};
 use crate::core::quote::Quote;
 use crate::core::symbol::Symbol;
-use crate::ui::chart::{DOWN, UP, render_candles, render_kdj, render_macd};
+use crate::ui::paint;
+use crate::ui::surface::Surface;
 
 /// 详情面板要显示的指标
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +53,7 @@ pub struct DetailView<'a> {
     pub bars: &'a BarState,
 }
 
-pub fn render(frame: &mut Frame, area: Rect, v: &DetailView) {
+pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surface) {
     let [head, chart_area, ind_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(3),
@@ -72,12 +73,20 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView) {
 
     // 右侧留出独立的价格轴栏位 —— 否则刻度文字会盖掉蜡烛
     const AXIS_W: u16 = 10;
-    let shown = (chart_area.width.saturating_sub(AXIS_W + 2) as usize).min(bars.len());
+    let plot_w = chart_area.width.saturating_sub(AXIS_W + 2);
+    let (step, _) = paint::layout(
+        surface.backend.canvas_size(Rect::new(0, 0, plot_w, 1)).0,
+        bars.len(),
+    );
+    let cw = surface.backend.canvas_size(Rect::new(0, 0, plot_w, 1)).0;
+    let shown = ((cw / step.max(1)) as usize).min(bars.len());
+
     let chart_block = Block::default().borders(Borders::ALL).title(format!(
-        " {} · 显示 {} / 共 {} 根 ",
+        " {} · 显示 {} / 共 {} 根 · {} ",
         v.timeframe.label(),
         shown,
-        bars.len()
+        bars.len(),
+        surface.backend.label()
     ));
     let inner = chart_block.inner(chart_area);
     frame.render_widget(chart_block, chart_area);
@@ -86,8 +95,12 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView) {
     let plot = Rect::new(inner.x, inner.y, inner.width.saturating_sub(axis_w), inner.height);
     let axis = Rect::new(inner.x + plot.width, inner.y, axis_w, inner.height);
 
-    if let Some(scale) = render_candles(plot, frame.buffer_mut(), bars) {
-        render_price_axis(frame, axis, scale);
+    let mut vscale = None;
+    surface.draw(plot, frame.buffer_mut(), |c| {
+        vscale = paint::candles(c, bars);
+    });
+    if let Some(vs) = vscale {
+        render_price_axis(frame, axis, vs);
     }
 
     let ind_block = Block::default()
@@ -95,17 +108,29 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView) {
         .title(format!(" {} ", v.indicator.label()));
     let ind_inner = ind_block.inner(ind_area);
     frame.render_widget(ind_block, ind_area);
+    // 指标面板与 K 线共用同一条右侧留白，纵向刻度对齐
+    let ind_plot = Rect::new(
+        ind_inner.x,
+        ind_inner.y,
+        ind_inner.width.saturating_sub(axis_w),
+        ind_inner.height,
+    );
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let n = bars.len();
     match v.indicator {
         IndicatorKind::Macd => {
-            render_macd(ind_inner, frame.buffer_mut(), &macd(&closes, 12, 26, 9))
+            let m = macd(&closes, 12, 26, 9);
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m, n));
         }
-        IndicatorKind::Kdj => render_kdj(ind_inner, frame.buffer_mut(), &kdj(bars, 9, 3.0, 3.0)),
+        IndicatorKind::Kdj => {
+            let k = kdj(bars, 9, 3.0, 3.0);
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k, n));
+        }
     }
 }
 
 /// 价格刻度。画在专属栏位里，不与蜡烛争地盘。
-fn render_price_axis(frame: &mut Frame, area: Rect, scale: crate::ui::chart::Scale) {
+fn render_price_axis(frame: &mut Frame, area: Rect, scale: paint::VScale) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -116,9 +141,8 @@ fn render_price_axis(frame: &mut Frame, area: Rect, scale: crate::ui::chart::Sca
         let frac = i as f64 / (ticks - 1).max(1) as f64;
         let price = scale.max - (scale.max - scale.min) * frac;
         let y = area.y + ((area.height - 1) as f64 * frac).round() as u16;
-        let txt = format!("{price:.2}");
         frame.render_widget(
-            Paragraph::new(Span::styled(txt, style)),
+            Paragraph::new(Span::styled(format!("{price:.2}"), style)),
             Rect::new(area.x + 1, y, area.width.saturating_sub(1), 1),
         );
     }
@@ -134,7 +158,7 @@ fn render_head(frame: &mut Frame, area: Rect, v: &DetailView) {
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if let Some(q) = v.quote {
-        let color = if q.is_up() { UP } else { DOWN };
+        let color = if q.is_up() { Color::Red } else { Color::Green };
         spans.push(Span::styled(format!("{}  ", q.name), Style::default()));
         spans.push(Span::styled(
             format!("{}  ", q.last),
@@ -240,7 +264,17 @@ mod axis_tests {
     }
 
     fn draw(w: u16, h: u16, n: usize) -> ratatui::buffer::Buffer {
+        draw_with(w, h, n, crate::ui::surface::Backend::Braille)
+    }
+
+    fn draw_with(
+        w: u16,
+        h: u16,
+        n: usize,
+        backend: crate::ui::surface::Backend,
+    ) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut surface = Surface::new(backend);
         let sym = crate::core::symbol::Symbol::parse("CN:600519").unwrap();
         let state = BarState::Ready(bars(n));
         term.draw(|f| {
@@ -254,6 +288,7 @@ mod axis_tests {
                     indicator: IndicatorKind::Macd,
                     bars: &state,
                 },
+                &mut surface,
             )
         })
         .unwrap();
@@ -329,5 +364,25 @@ mod axis_tests {
     fn 窄面板退到两档刻度也不panic() {
         let _ = draw(60, 12, 100);
         let _ = draw(42, 24, 100);
+    }
+
+    #[test]
+    fn 位图后端下详情屏不写字符层但产生转义序列() {
+        use crate::ui::kitty::CellPixels;
+        use crate::ui::surface::Backend;
+        // 位图模式下 K线区应是空的（图叠在字符层之上），
+        // 但边框、标题、刻度这些字符仍然要画
+        let buf = draw_with(140, 40, 300, Backend::Kitty(CellPixels::FALLBACK));
+        let t = text(&buf, 140, 40);
+        assert!(t.contains("位图"), "标题应标明当前后端：{}", &t[..120.min(t.len())]);
+        assert!(t.contains("日线"), "边框标题仍要画");
+        let blocks = buf.content().iter().filter(|c| matches!(c.symbol(), "█" | "▀" | "▄")).count();
+        assert_eq!(blocks, 0, "位图模式不该往字符层画块字符");
+    }
+
+    #[test]
+    fn 盲文后端下标题标明后端() {
+        let t = text(&draw(140, 40, 300), 140, 40);
+        assert!(t.contains("盲文"), "标题应标明当前后端");
     }
 }
