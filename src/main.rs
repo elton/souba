@@ -191,23 +191,31 @@ async fn run(
 
         let quotes = qrx.borrow().clone();
         let (bar_key, bar_state) = bar_rx.borrow().clone();
-        let mut surface = Surface::new(backend);
+
+        // 先算 stamp 再决定要不要画位图 —— 之前是画完才发现没变然后扔掉，
+        // 白白付出一张 400 万像素画布的分配与绘制开销。鼠标移动时这是主要瓶颈。
+        let stamp = (
+            app.screen,
+            app.selected,
+            app.timeframe,
+            app.indicator,
+            app.viewport,
+            terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
+            bar_len(&bar_state),
+        );
+        let bitmap_unchanged = stamp == last_stamp;
+        let mut surface = Surface::with_skip(backend, bitmap_unchanged);
         terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state, &mut surface))?;
+
         // 位图叠在字符层之上，必须在 ratatui 画完之后才发。
-        // ratatui 只重绘变化的格子，所以图不会被每帧擦掉 —— 但内容变了要重发。
-        // 注意：**不含鼠标位置**。十字光标走字符层，鼠标移动不该触发位图重发 ——
-        // 那张图压缩后还有几百 KB，每帧发一次会卡。
-        let stamp = (app.screen, app.selected, app.timeframe, app.indicator, app.viewport,
-                     terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
-                     bar_len(&bar_state));
         if let Some(seq) = surface.escape.take() {
-            if stamp != last_stamp {
-                let _ = crate::ui::kitty::emit(&seq);
-                last_stamp = stamp;
+            let _ = crate::ui::kitty::emit(&seq);
+            last_stamp = stamp;
+        } else if !bitmap_unchanged {
+            // 这一帧没产生图（切回列表屏、或数据还没到），把残留的图清掉
+            if matches!(backend, Backend::Kitty(_)) && last_stamp.0 == Screen::Detail {
+                let _ = crate::ui::kitty::emit(&crate::ui::kitty::clear());
             }
-        } else if matches!(backend, Backend::Kitty(_)) && app.screen != Screen::Detail && last_stamp.0 == Screen::Detail {
-            // 从详情退回列表：清掉残留的图
-            let _ = crate::ui::kitty::emit(&crate::ui::kitty::clear());
             last_stamp = stamp;
         }
 

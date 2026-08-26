@@ -173,6 +173,33 @@ fn line(c: &mut Canvas, values: &[f64], step: f64, vs: VScale, color: Rgb, width
 }
 
 /// MACD：柱状体 + DIF/DEA
+/// MACD 面板的纵向刻度。抽出来是为了让命中测试和绘制用同一套映射 ——
+/// 两处各算一遍迟早会算歪，读数就成了骗人的。
+pub fn macd_scale(m: &Macd, h: u32) -> Option<VScale> {
+    if m.hist.is_empty() || h == 0 {
+        return None;
+    }
+    let all: Vec<f64> = m
+        .hist
+        .iter()
+        .chain(&m.dif)
+        .chain(&m.dea)
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    if all.is_empty() {
+        return None;
+    }
+    let lo = all.iter().fold(f64::MAX, |a, b| a.min(*b));
+    let hi = all.iter().fold(f64::MIN, |a, b| a.max(*b));
+    Some(VScale::new(lo, hi, h))
+}
+
+/// KDJ 面板的纵向刻度。固定 0–100，J 越界时夹到边缘。
+pub fn kdj_scale(h: u32) -> VScale {
+    VScale::new(0.0, 100.0, h)
+}
+
 /// MACD 面板。`m` 已经是按视口切好的那一段（但指标本身要在**全量**数据上
 /// 算完再切，否则窗口左边缘的值会因缺少预热而失真）。
 pub fn macd(c: &mut Canvas, m: &Macd, v_at: &[usize]) {
@@ -182,19 +209,9 @@ pub fn macd(c: &mut Canvas, m: &Macd, v_at: &[usize]) {
     let (step, body_w) = layout(c.w, m.hist.len());
     let (hist, dif, dea) = (&m.hist, &m.dif, &m.dea);
 
-    let all: Vec<f64> = hist
-        .iter()
-        .chain(dif)
-        .chain(dea)
-        .copied()
-        .filter(|v| v.is_finite())
-        .collect();
-    if all.is_empty() {
+    let Some(vs) = macd_scale(m, c.h) else {
         return;
-    }
-    let lo = all.iter().fold(f64::MAX, |a, b| a.min(*b));
-    let hi = all.iter().fold(f64::MIN, |a, b| a.max(*b));
-    let vs = VScale::new(lo, hi, c.h);
+    };
 
     // 竖线与主图对齐，方便把 MACD 的拐点对到日期上
     grid(c, vs, &Grid { v_at, h_lines: 0 }, m.hist.len());
@@ -231,7 +248,7 @@ pub fn kdj(c: &mut Canvas, k: &Kdj, v_at: &[usize]) {
         return;
     }
     let (step, _) = layout(c.w, k.k.len());
-    let vs = VScale::new(0.0, 100.0, c.h);
+    let vs = kdj_scale(c.h);
     grid(c, vs, &Grid { v_at, h_lines: 0 }, k.k.len());
     // 20/50/80 是 KDJ 的超买超卖参考位，比普通网格显眼
     for lvl in [20.0, 50.0, 80.0] {

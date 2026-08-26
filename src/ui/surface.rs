@@ -86,19 +86,39 @@ pub struct Surface {
     pub escape: Option<String>,
     /// 本帧已用掉几个图像 slot。每个面板一个，各自独立删除与放置。
     slot: u32,
+    /// 位图内容没变时跳过绘制。
+    ///
+    /// **这是帧率的关键**：一张 400 万像素的画布光分配加清零就是 16MB 内存写，
+    /// 再叠上蜡烛绘制。鼠标移动时内容根本没变，画完还要扔掉，纯属浪费。
+    /// 跳过之后鼠标移动只剩几十个字符的重绘。
+    ///
+    /// 图像本身留在屏幕上不会消失 —— 它在 z=-1，字符层的十字光标移开后
+    /// 那些格子恢复成空白，图就重新透出来。
+    skip_bitmap: bool,
 }
 
 impl Surface {
+    #[cfg(test)]
     pub fn new(backend: Backend) -> Self {
+        Self::with_skip(backend, false)
+    }
+
+    pub fn with_skip(backend: Backend, skip_bitmap: bool) -> Self {
         Self {
             backend,
             escape: None,
             slot: 0,
+            skip_bitmap,
         }
     }
 
     pub fn draw<F: FnOnce(&mut Canvas)>(&mut self, area: Rect, buf: &mut Buffer, paint: F) {
         if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // 盲文后端写的是字符层，ratatui 每帧都要重建 buffer，不能跳
+        if self.skip_bitmap && matches!(self.backend, Backend::Kitty(_)) {
+            self.slot += 1;
             return;
         }
         let (w, h) = self.backend.canvas_size(area);
@@ -288,6 +308,47 @@ mod tests {
         assert_eq!(nearest_ansi(Rgb(0, 255, 0)), Color::Green);
         assert_eq!(nearest_ansi(Rgb(250, 250, 250)), Color::White);
         assert_eq!(nearest_ansi(Rgb(5, 5, 5)), Color::Black);
+    }
+
+    #[test]
+    fn 跳过时不产生转义序列也不画画布() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 40));
+        let mut s = Surface::with_skip(Backend::Kitty(CellPixels::FALLBACK), true);
+        let mut painted = false;
+        s.draw(Rect::new(0, 0, 8, 4), &mut buf, |c| {
+            painted = true;
+            c.set(0, 0, RED);
+        });
+        assert!(!painted, "跳过时不该调用绘制闭包 —— 那才是省下的开销");
+        assert!(s.escape.is_none());
+    }
+
+    #[test]
+    fn 跳过时slot仍然递增() {
+        // 否则下一帧不跳过时，各面板的 slot 会错位、图像互相覆盖
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 40));
+        let mut s = Surface::with_skip(Backend::Kitty(CellPixels::FALLBACK), true);
+        s.draw(Rect::new(0, 0, 8, 4), &mut buf, |_| {});
+        s.draw(Rect::new(0, 5, 8, 4), &mut buf, |_| {});
+        let mut s2 = Surface::new(Backend::Kitty(CellPixels::FALLBACK));
+        s2.draw(Rect::new(0, 0, 8, 4), &mut buf, |c| c.set(0, 0, RED));
+        s2.draw(Rect::new(0, 5, 8, 4), &mut buf, |c| c.set(0, 0, RED));
+        let esc = s2.escape.unwrap();
+        assert!(esc.contains("i=7301,") && esc.contains("i=7302,"));
+    }
+
+    #[test]
+    fn 盲文后端不受跳过影响() {
+        // 盲文写的是字符层，ratatui 每帧重建 buffer，跳过会导致图消失
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut s = Surface::with_skip(Backend::Braille, true);
+        s.draw(Rect::new(0, 0, 8, 4), &mut buf, |c| {
+            c.fill_rect(0, 0, 16, 16, RED);
+        });
+        assert!(
+            buf.content().iter().any(|c| c.symbol() != " "),
+            "盲文后端必须每帧都画"
+        );
     }
 
     #[test]

@@ -60,44 +60,67 @@ pub struct DetailView<'a> {
     pub mouse: Option<(u16, u16)>,
 }
 
+/// 鼠标停在哪个面板上
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoverPane {
+    Chart,
+    Indicator,
+}
+
 /// 鼠标落点换算出的读数
 struct Hover {
+    pane: HoverPane,
     bar: Bar,
     /// 在可视窗口里的下标
     index: usize,
-    /// 鼠标那一行对应的价格
-    price: f64,
-    /// 画布内的像素行
-    canvas_y: u32,
+    /// 鼠标那一行对应的数值（主图是价格，指标面板是指标值）
+    value: f64,
+    /// 鼠标所在的终端行，横线画这里
+    row: u16,
+    /// 鼠标所在的终端列，竖线画这里
+    col: u16,
 }
 
-/// 把鼠标的格子坐标换算成「第几根 K 线 / 什么价位」。
-/// 落在图外返回 None —— 不能让十字光标停在上一次的位置上骗人。
+/// 鼠标是否落在某个矩形里
+fn inside(mouse: (u16, u16), r: Rect) -> bool {
+    let (x, y) = mouse;
+    r.width > 0 && r.height > 0 && x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height
+}
+
+/// 把鼠标的格子坐标换算成「第几根 K 线 / 什么数值」。
+///
+/// 两个面板横向布局相同，所以下标算法共用；纵向的映射各用各的刻度。
+/// 落在两个面板之外返回 None —— 不能让十字光标停在上一次的位置上骗人。
 fn hover_at(
     mouse: Option<(u16, u16)>,
-    plot: Rect,
+    chart: Rect,
+    indicator: Rect,
     window: &[Bar],
-    vs: paint::VScale,
+    chart_vs: paint::VScale,
+    ind_vs: Option<paint::VScale>,
 ) -> Option<Hover> {
-    let (mx, my) = mouse?;
-    if window.is_empty()
-        || plot.width == 0
-        || plot.height == 0
-        || mx < plot.x
-        || my < plot.y
-        || mx >= plot.x + plot.width
-        || my >= plot.y + plot.height
-    {
+    let m = mouse?;
+    if window.is_empty() {
         return None;
     }
-    let fx = (mx - plot.x) as f64 / (plot.width.max(2) - 1) as f64;
+    let (pane, area, vs) = if inside(m, chart) {
+        (HoverPane::Chart, chart, Some(chart_vs))
+    } else if inside(m, indicator) {
+        (HoverPane::Indicator, indicator, ind_vs)
+    } else {
+        return None;
+    };
+    let vs = vs?;
+    let fx = (m.0 - area.x) as f64 / (area.width.max(2) - 1) as f64;
     let index = ((fx * (window.len() - 1) as f64).round() as usize).min(window.len() - 1);
-    let fy = (my - plot.y) as f64 / (plot.height.max(2) - 1) as f64;
+    let fy = (m.1 - area.y) as f64 / (area.height.max(2) - 1) as f64;
     Some(Hover {
+        pane,
         bar: window[index],
         index,
-        price: vs.max - (vs.max - vs.min) * fy,
-        canvas_y: (fy * (vs.h.max(1) - 1) as f64).round() as u32,
+        value: vs.max - (vs.max - vs.min) * fy,
+        row: m.1,
+        col: m.0,
     })
 }
 
@@ -129,15 +152,14 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     } else {
         format!("←{} 根前", bars.len() - hi)
     };
-    let base_title = format!(
+    let chart_block = Block::default().borders(Borders::ALL).title(format!(
         " {} · {} 根 / 共 {} · {} · {} ",
         v.timeframe.label(),
         window.len(),
         bars.len(),
         pos,
         v.surface_label
-    );
-    let chart_block = Block::default().borders(Borders::ALL).title(base_title);
+    ));
     let inner = chart_block.inner(chart_area);
     frame.render_widget(chart_block, chart_area);
 
@@ -147,6 +169,47 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     let body_h = inner.height.saturating_sub(time_h);
     let plot = Rect::new(inner.x, inner.y, inner.width.saturating_sub(axis_w), body_h);
     let axis = Rect::new(inner.x + plot.width, inner.y, axis_w, body_h);
+
+    // 指标必须在**全量**数据上算完再按视口切 —— 只拿窗口内的数据算，
+    // 左边缘会因为缺少预热而失真（MACD 要 26+9 根、EMA576 要上千根）。
+    // 指标必须在**全量**数据上算完再按视口切 —— 只拿窗口内的数据算，
+    // 左边缘会因为缺少预热而失真（MACD 要 26+9 根、EMA576 要上千根）。
+    let macd_win = (v.indicator == IndicatorKind::Macd).then(|| {
+        let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+        let f = macd(&closes, 12, 26, 9);
+        Macd {
+            dif: f.dif[lo..hi].to_vec(),
+            dea: f.dea[lo..hi].to_vec(),
+            hist: f.hist[lo..hi].to_vec(),
+        }
+    });
+    let kdj_win = (v.indicator == IndicatorKind::Kdj).then(|| {
+        let f = kdj(bars, 9, 3.0, 3.0);
+        Kdj {
+            k: f.k[lo..hi].to_vec(),
+            d: f.d[lo..hi].to_vec(),
+            j: f.j[lo..hi].to_vec(),
+        }
+    });
+    let (macd_win, kdj_win) = (macd_win.as_ref(), kdj_win.as_ref());
+
+    let ind_inner_probe = Block::default().borders(Borders::ALL).inner(ind_area);
+    let ind_plot = Rect::new(
+        ind_inner_probe.x,
+        ind_inner_probe.y,
+        ind_inner_probe.width.saturating_sub(axis_w),
+        ind_inner_probe.height,
+    );
+
+    // 两个面板各自的纵向刻度，用于命中测试。与绘制共用同一套映射函数。
+    let canvas_h = |r: Rect| surface.backend.canvas_size(r).1;
+    let chart_vs = paint::vscale_of(window, canvas_h(plot));
+    let ind_vs = match (macd_win, kdj_win) {
+        (Some(m), _) => paint::macd_scale(m, canvas_h(ind_plot)),
+        (_, Some(_)) => Some(paint::kdj_scale(canvas_h(ind_plot))),
+        _ => None,
+    };
+    let hover = chart_vs.and_then(|cvs| hover_at(v.mouse, plot, ind_plot, window, cvs, ind_vs));
 
     // 竖线贴在时间刻度上、横线用价格刻度的档位 —— 网格与坐标轴数字对齐，
     // 才谈得上「参考」，不然只是花纹。
@@ -161,28 +224,65 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
         h_lines: price_levels,
     };
 
-    // 先按画布高度算一版 VScale 用于命中测试；绘制时 candles 会算出同样的值
-    let probe_h = surface.backend.canvas_size(plot).1;
-    let probe_vs = paint::vscale_of(window, probe_h);
-    let hover = probe_vs.and_then(|vs| hover_at(v.mouse, plot, window, vs));
-    let hover_idx = hover.as_ref().map(|h| (h.index, h.canvas_y));
-
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
         vscale = paint::candles(c, window, Some(&g));
     });
-    // 十字光标用终端字符画在文字层，位图在 z=-1 之下 ——
-    // 这样鼠标一动只重画几个字符，不用重发那张几十 MB 的位图。
-    if hover_idx.is_some() {
-        render_crosshair(frame, plot, v.mouse);
-    }
+    let vscale = vscale.or(chart_vs);
+
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
-        if let Some(h) = &hover {
-            // 光标那一行的价格，压在刻度上方显示
-            let y = plot.y + (h.canvas_y as f64 / (vs.h.max(1) - 1) as f64
-                * (plot.height.max(2) - 1) as f64).round() as u16;
-            let txt = format!("{:.2}", h.price);
+    }
+    if time_h > 0 {
+        render_time_axis(
+            frame,
+            Rect::new(inner.x, inner.y + body_h, plot.width, 1),
+            window,
+            v.timeframe,
+            tz,
+        );
+    }
+
+    // 指标面板标题带上悬停那根的数值
+    let ind_title = match (&hover, macd_win, kdj_win) {
+        (Some(h), Some(m), _) if h.index < m.dif.len() => format!(
+            " {} · DIF {:.2}  DEA {:.2}  MACD {:.2} ",
+            v.indicator.label(),
+            m.dif[h.index],
+            m.dea[h.index],
+            m.hist[h.index]
+        ),
+        (Some(h), _, Some(k)) if h.index < k.k.len() => format!(
+            " {} · K {:.1}  D {:.1}  J {:.1} ",
+            v.indicator.label(),
+            k.k[h.index],
+            k.d[h.index],
+            k.j[h.index]
+        ),
+        _ => format!(" {} ", v.indicator.label()),
+    };
+    let ind_block = Block::default().borders(Borders::ALL).title(ind_title);
+    frame.render_widget(ind_block, ind_area);
+    match (macd_win, kdj_win) {
+        (Some(m), _) => {
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, m, &tick_idx))
+        }
+        (_, Some(k)) => surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, k, &tick_idx)),
+        _ => {}
+    }
+
+    // 十字光标：竖线贯穿两个面板（才能把指标的拐点对到 K 线上），
+    // 横线只画在鼠标所在的那个面板。
+    if let Some(h) = &hover {
+        render_crosshair(frame, plot, ind_plot, h);
+        let (label_area, txt) = match h.pane {
+            HoverPane::Chart => (axis, format!("{:.2}", h.value)),
+            HoverPane::Indicator => (
+                Rect::new(ind_plot.x + ind_plot.width, ind_plot.y, axis_w, ind_plot.height),
+                format!("{:.2}", h.value),
+            ),
+        };
+        if label_area.width > 1 {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     txt.clone(),
@@ -191,14 +291,15 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
                         .bg(Color::Gray)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Rect::new(axis.x + 1, y.min(axis.y + axis.height - 1),
-                          (txt.chars().count() as u16).min(axis.width.saturating_sub(1)), 1),
+                Rect::new(
+                    label_area.x + 1,
+                    h.row.clamp(label_area.y, label_area.y + label_area.height - 1),
+                    (txt.chars().count() as u16).min(label_area.width - 1),
+                    1,
+                ),
             );
         }
-    }
-    // 悬停时把那根 K 线的 OHLC 显示在图表顶部 —— 光有十字线不知道读的是什么
-    if let Some(h) = &hover {
-        let tz = v.symbol.market.timezone();
+        // 悬停那根的 OHLC 显示在图表顶部 —— 光有十字线不知道读的是什么
         let when = h.bar.ts.with_timezone(&tz);
         let fmt = if matches!(v.timeframe, Timeframe::Day | Timeframe::Week | Timeframe::Month) {
             when.format("%Y-%m-%d").to_string()
@@ -207,87 +308,55 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
         };
         let up = h.bar.close >= h.bar.open;
         let color = if up { Color::Red } else { Color::Green };
-        let line = Line::from(vec![
-            Span::styled(format!(" {fmt} "), Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!(
-                    "开 {:.2}  高 {:.2}  低 {:.2}  收 {:.2}",
-                    h.bar.open, h.bar.high, h.bar.low, h.bar.close
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {fmt} "), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(
+                        "开 {:.2}  高 {:.2}  低 {:.2}  收 {:.2}",
+                        h.bar.open, h.bar.high, h.bar.low, h.bar.close
+                    ),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y, inner.width, 1));
-    }
-
-    if time_h > 0 {
-        render_time_axis(
-            frame,
-            Rect::new(inner.x, inner.y + body_h, plot.width, 1),
-            window,
-            v.timeframe,
-            v.symbol.market.timezone(),
+            ])),
+            Rect::new(inner.x, inner.y, inner.width, 1),
         );
-    }
-
-    let ind_block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", v.indicator.label()));
-    let ind_inner = ind_block.inner(ind_area);
-    frame.render_widget(ind_block, ind_area);
-    // 指标面板与 K 线共用同一条右侧留白，横坐标才对得齐
-    let ind_plot = Rect::new(
-        ind_inner.x,
-        ind_inner.y,
-        ind_inner.width.saturating_sub(axis_w),
-        ind_inner.height,
-    );
-    // 指标必须在**全量**数据上算完再按视口切 —— 只拿窗口内的数据算，
-    // 左边缘会因为缺少预热而失真（MACD 要 26+9 根、EMA576 要上千根）。
-    match v.indicator {
-        IndicatorKind::Macd => {
-            let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-            let full = macd(&closes, 12, 26, 9);
-            let m = Macd {
-                dif: full.dif[lo..hi].to_vec(),
-                dea: full.dea[lo..hi].to_vec(),
-                hist: full.hist[lo..hi].to_vec(),
-            };
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m, &tick_idx));
-        }
-        IndicatorKind::Kdj => {
-            let full = kdj(bars, 9, 3.0, 3.0);
-            let k = Kdj {
-                k: full.k[lo..hi].to_vec(),
-                d: full.d[lo..hi].to_vec(),
-                j: full.j[lo..hi].to_vec(),
-            };
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k, &tick_idx));
-        }
     }
 }
 
 /// 十字光标。用终端字符而不是画进位图 —— 位图每帧几十 MB，
 /// 鼠标一动就重发会直接卡死；字符层重画几十个格子是零成本。
 ///
-/// 代价是精度只到字符格，但十字线本来就是读数辅助不是数据，够用。
-fn render_crosshair(frame: &mut Frame, plot: Rect, mouse: Option<(u16, u16)>) {
-    let Some((mx, my)) = mouse else { return };
+/// 竖线**贯穿主图与指标面板**：把 MACD 的拐点对到某一天的 K 线上，
+/// 是看指标最常做的事，两条断开的竖线就对不上了。
+/// 横线只画在鼠标所在的面板 —— 它读的是那个面板的纵轴。
+fn render_crosshair(frame: &mut Frame, chart: Rect, indicator: Rect, h: &Hover) {
     let style = Style::default().fg(Color::Gray);
     let buf = frame.buffer_mut();
-    for x in plot.x..(plot.x + plot.width) {
-        if x == mx {
+
+    for pane in [chart, indicator] {
+        if pane.width == 0 || pane.height == 0 || h.col < pane.x || h.col >= pane.x + pane.width {
             continue;
         }
-        buf[(x, my)].set_char('─').set_style(style);
+        for y in pane.y..(pane.y + pane.height) {
+            if y == h.row {
+                continue;
+            }
+            buf[(h.col, y)].set_char('│').set_style(style);
+        }
     }
-    for y in plot.y..(plot.y + plot.height) {
-        if y == my {
+
+    let own = match h.pane {
+        HoverPane::Chart => chart,
+        HoverPane::Indicator => indicator,
+    };
+    for x in own.x..(own.x + own.width) {
+        if x == h.col {
             continue;
         }
-        buf[(mx, y)].set_char('│').set_style(style);
+        buf[(x, h.row)].set_char('─').set_style(style);
     }
-    buf[(mx, my)].set_char('┼').set_style(
+    buf[(h.col, h.row)].set_char('┼').set_style(
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
@@ -673,114 +742,193 @@ mod hover_tests {
             .collect()
     }
 
-    fn plot() -> Rect {
-        Rect::new(10, 5, 100, 40)
+    const CHART: Rect = Rect { x: 10, y: 5, width: 100, height: 40 };
+    const IND: Rect = Rect { x: 10, y: 47, width: 100, height: 10 };
+
+    fn cvs(b: &[Bar]) -> paint::VScale {
+        paint::vscale_of(b, 400).unwrap()
+    }
+    fn ivs() -> Option<paint::VScale> {
+        Some(paint::kdj_scale(100))
     }
 
-    fn vs(b: &[Bar]) -> paint::VScale {
-        paint::vscale_of(b, 400).unwrap()
+    fn hit(pos: Option<(u16, u16)>, b: &[Bar]) -> Option<Hover> {
+        hover_at(pos, CHART, IND, b, cvs(b), ivs())
     }
 
     #[test]
-    fn 鼠标在图外返回none() {
+    fn 鼠标在两个面板之外返回none() {
         let b = bars(50);
-        let p = plot();
-        for pos in [(0u16, 0u16), (9, 20), (200, 20), (50, 4), (50, 100)] {
-            assert!(
-                hover_at(Some(pos), p, &b, vs(&b)).is_none(),
-                "{pos:?} 在图外，不该产生读数"
-            );
+        for pos in [(0u16, 0u16), (9, 20), (200, 20), (50, 4), (50, 46), (50, 100)] {
+            assert!(hit(Some(pos), &b).is_none(), "{pos:?} 在面板外，不该产生读数");
         }
     }
 
     #[test]
     fn 没有鼠标时返回none() {
-        let b = bars(50);
-        assert!(hover_at(None, plot(), &b, vs(&b)).is_none());
+        assert!(hit(None, &bars(50)).is_none());
+    }
+
+    #[test]
+    fn 落在主图判定为主图() {
+        let h = hit(Some((CHART.x + 20, CHART.y + 10)), &bars(50)).unwrap();
+        assert_eq!(h.pane, HoverPane::Chart);
+    }
+
+    #[test]
+    fn 落在指标面板判定为指标面板() {
+        let h = hit(Some((IND.x + 20, IND.y + 3)), &bars(50)).unwrap();
+        assert_eq!(h.pane, HoverPane::Indicator);
+    }
+
+    #[test]
+    fn 两个面板同一列命中同一根k线() {
+        // 竖线贯穿两个面板的前提：横向布局一致
+        let b = bars(200);
+        let x = CHART.x + 37;
+        let a = hit(Some((x, CHART.y + 5)), &b).unwrap();
+        let c = hit(Some((x, IND.y + 5)), &b).unwrap();
+        assert_eq!(a.index, c.index, "同一列在两个面板应命中同一根");
     }
 
     #[test]
     fn 左边缘命中第一根右边缘命中最后一根() {
         let b = bars(50);
-        let p = plot();
-        let left = hover_at(Some((p.x, p.y + 10)), p, &b, vs(&b)).unwrap();
-        assert_eq!(left.index, 0);
-        let right = hover_at(Some((p.x + p.width - 1, p.y + 10)), p, &b, vs(&b)).unwrap();
-        assert_eq!(right.index, b.len() - 1);
+        assert_eq!(hit(Some((CHART.x, CHART.y + 10)), &b).unwrap().index, 0);
+        assert_eq!(
+            hit(Some((CHART.x + CHART.width - 1, CHART.y + 10)), &b).unwrap().index,
+            b.len() - 1
+        );
     }
 
     #[test]
     fn 命中的是鼠标下方那根的真实数据() {
         let b = bars(50);
-        let p = plot();
-        let h = hover_at(Some((p.x + p.width / 2, p.y + 10)), p, &b, vs(&b)).unwrap();
+        let h = hit(Some((CHART.x + CHART.width / 2, CHART.y + 10)), &b).unwrap();
         assert_eq!(h.bar.close, b[h.index].close, "读数必须来自命中的那一根");
     }
 
     #[test]
-    fn 顶部读到高价底部读到低价() {
+    fn 主图顶部读到高价底部读到低价() {
         let b = bars(50);
-        let p = plot();
-        let top = hover_at(Some((p.x + 5, p.y)), p, &b, vs(&b)).unwrap();
-        let bottom = hover_at(Some((p.x + 5, p.y + p.height - 1)), p, &b, vs(&b)).unwrap();
-        assert!(top.price > bottom.price, "上方价格应更高");
-        let scale = vs(&b);
-        assert!((top.price - scale.max).abs() < 1.0, "顶部应贴近区间上沿");
-        assert!((bottom.price - scale.min).abs() < 1.0, "底部应贴近区间下沿");
+        let top = hit(Some((CHART.x + 5, CHART.y)), &b).unwrap();
+        let bot = hit(Some((CHART.x + 5, CHART.y + CHART.height - 1)), &b).unwrap();
+        assert!(top.value > bot.value, "上方价格应更高");
+        let sc = cvs(&b);
+        assert!((top.value - sc.max).abs() < 1.0, "顶部应贴近区间上沿");
+        assert!((bot.value - sc.min).abs() < 1.0, "底部应贴近区间下沿");
+    }
+
+    #[test]
+    fn 指标面板用自己的纵轴而不是价格轴() {
+        // KDJ 固定 0-100，绝不该读出四位数的股价
+        let b = bars(50);
+        let h = hit(Some((IND.x + 5, IND.y + 5)), &b).unwrap();
+        assert!(
+            (-10.0..=110.0).contains(&h.value),
+            "指标面板读出了 {} —— 用错了纵轴",
+            h.value
+        );
+    }
+
+    #[test]
+    fn 指标刻度缺失时不命中指标面板() {
+        // 数据不足算不出 MACD 刻度时，宁可不显示也不能读出乱数
+        let b = bars(50);
+        assert!(
+            hover_at(Some((IND.x + 5, IND.y + 5)), CHART, IND, &b, cvs(&b), None).is_none()
+        );
     }
 
     #[test]
     fn 空数据不panic() {
-        assert!(hover_at(Some((20, 10)), plot(), &[], paint::VScale::new(0.0, 1.0, 10)).is_none());
+        assert!(
+            hover_at(Some((20, 10)), CHART, IND, &[], paint::VScale::new(0.0, 1.0, 10), ivs())
+                .is_none()
+        );
     }
 
     #[test]
     fn 极小面板不panic() {
         let b = bars(3);
-        for p in [Rect::new(0, 0, 1, 1), Rect::new(0, 0, 2, 1), Rect::new(0, 0, 1, 2)] {
-            let _ = hover_at(Some((0, 0)), p, &b, vs(&b));
+        for r in [Rect::new(0, 0, 1, 1), Rect::new(0, 0, 2, 1), Rect::new(0, 0, 1, 2)] {
+            let _ = hover_at(Some((0, 0)), r, r, &b, cvs(&b), ivs());
         }
     }
 
-    #[test]
-    fn 悬停时标题栏显示ohlc() {
+    fn render_hover(mouse: Option<(u16, u16)>, ind: IndicatorKind) -> String {
         let b = bars(300);
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        let (w, h) = (160u16, 44u16);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         let sym = crate::core::symbol::Symbol::parse("CN:600519").unwrap();
         let state = BarState::Ready(b);
         let mut surface = Surface::new(crate::ui::surface::Backend::Braille);
         term.draw(|f| {
             render(
                 f,
-                Rect::new(0, 0, 160, 40),
+                Rect::new(0, 0, w, h),
                 &DetailView {
                     symbol: &sym,
                     quote: None,
                     timeframe: Timeframe::Day,
-                    indicator: IndicatorKind::Macd,
+                    indicator: ind,
                     bars: &state,
                     viewport: Viewport::default(),
                     surface_label: "盲文",
-                    mouse: Some((60, 12)),
+                    mouse,
                 },
                 &mut surface,
             )
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
-        let t: String = (0..40u16)
+        (0..h)
             .map(|y| {
                 let mut out = String::new();
                 let mut x = 0u16;
-                while x < 160 {
-                    let s = buf[(x, y)].symbol();
-                    out.push_str(s);
-                    x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    out.push_str(sym);
+                    x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
                 }
                 out
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
+
+    #[test]
+    fn 悬停主图时显示ohlc() {
+        let t = render_hover(Some((60, 12)), IndicatorKind::Macd);
         assert!(t.contains("开 ") && t.contains("收 "), "悬停应显示 OHLC 读数");
+    }
+
+    #[test]
+    fn 悬停时指标标题显示当根数值() {
+        let t = render_hover(Some((60, 12)), IndicatorKind::Macd);
+        assert!(t.contains("DIF") && t.contains("DEA"), "MACD 标题应显示 DIF/DEA：{t}");
+        let k = render_hover(Some((60, 12)), IndicatorKind::Kdj);
+        assert!(k.contains("K ") && k.contains("J "), "KDJ 标题应显示 K/D/J");
+    }
+
+    #[test]
+    fn 不悬停时指标标题只有名字() {
+        let t = render_hover(None, IndicatorKind::Macd);
+        assert!(t.contains("MACD(12,26,9)"));
+        assert!(!t.contains("DIF"), "没悬停不该显示数值");
+    }
+
+    #[test]
+    fn 十字光标的竖线贯穿两个面板() {
+        let t = render_hover(Some((60, 12)), IndicatorKind::Macd);
+        let lines: Vec<&str> = t.lines().collect();
+        // 主图区和指标区各自都要有竖线字符
+        let chart_rows = 4..30usize;
+        let ind_rows = 34..43usize;
+        let has = |rows: std::ops::Range<usize>| {
+            rows.filter_map(|i| lines.get(i)).any(|l| l.contains('│'))
+        };
+        assert!(has(chart_rows), "主图区没有竖线");
+        assert!(has(ind_rows), "指标区没有竖线 —— 竖线应贯穿两个面板");
     }
 }
