@@ -57,13 +57,23 @@ memory — these endpoints are undocumented and drift.
 Full numbers in [`docs/research/2026-08-26-cloudflare-free-limits.md`](docs/research/2026-08-26-cloudflare-free-limits.md).
 Three of them are load-bearing:
 
-- **Worker CPU is 10 ms per invocation** (wall-clock is unlimited; CPU is not). Parsing a fat JSON
-  payload alone typically costs 10-20 ms. **Indicators are therefore computed in the Rust TUI, never
-  on the Worker.** Any design that moves computation server-side is wrong on this plan.
+- **10 ms CPU per invocation applies to Workers, Durable Objects AND Cron Triggers alike** — the DO
+  FAQ says verbatim that Durable Objects "have the same per invocation CPU limits as any Workers do".
+  Wall-clock is unlimited; CPU is not. Parsing a fat JSON payload alone typically costs 10-20 ms.
+  Two consequences: **indicators are computed in the Rust TUI, never on the Worker**; and **cold-start
+  history backfill (1800 bars) happens in the TUI too**, which then POSTs batches to the Worker for
+  storage. Cron does only the daily incremental append — one new bar per symbol per timeframe, which
+  is small enough to fit. A design where Cron backfills history does not work on this plan.
 - **KV allows 1,000 writes/day** and is eventually consistent. It cannot cache quotes. Use D1.
 - **One always-awake Durable Object consumes ~85% of the daily DO duration budget**, and an outbound
   WebSocket keeps an object alive for at most 15 min anyway. **No persistent DO connection to a data
   vendor.** A plain Worker WebSocket to the TUI is free and unlimited in duration — use that instead.
+  (Outgoing DO WebSocket messages are *not* charged; the disqualifier is CPU and duration, not messages.)
+- **Nothing here has been tested from an actual Cloudflare Worker.** Every probe ran from a Japanese
+  residential IP. Workers egress from shared datacenter IPs, and Yahoo already 429s those on the first
+  request. Verify Worker-side reachability in the very first implementation step, not after the design
+  is built out. The architecture hedges this — live quotes come from the TUI, so Worker IP reputation
+  only affects the daily append path, which can fall back to the TUI as well.
 - **Cron Triggers are 5 per ACCOUNT**, not per Worker. `eltonzheng-me` already uses one
   (`*/5 * * * *`), so **souba has 4 available**. Budget them deliberately.
 

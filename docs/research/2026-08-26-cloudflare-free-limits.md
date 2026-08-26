@@ -6,14 +6,24 @@
 
 ## 一、会改变架构的三条硬约束
 
-### 1. Worker CPU 每次调用只有 **10 ms**（不是 30 秒）
+### 1. **所有**计算入口都是 10 ms CPU —— Worker、Durable Object、Cron 一视同仁
 
 这是最容易误判的一条。Workers 免费版的**墙钟时间不限**（HTTP 触发的 Worker 只要客户端连着就能一直跑），
 但 **CPU 时间每次调用上限 10 ms**。Cloudflare 自己的文档说「解析大 JSON 负载」典型消耗 10–20 ms。
 
-**推论：指标计算绝不能放在 Worker 上。**
+**而且这个限制没有例外。** DO 限制 FAQ 原文：「Durable Objects are Worker scripts, and have the same
+per invocation CPU limits as any Workers do」。Cron Trigger 同样是 10 ms（付费版才是 30 s）。
+
+**推论一：指标计算绝不能放在 Worker 上。**
 `EMA576` 要跑 1800 根 K 线，MACD/KDJ 再叠上去，10 ms 根本不够。
 → **指标在 Rust TUI 客户端本地算。** 这同时也让客户端离线可用。
+
+**推论二：冷启动的历史回补也不能放在 Worker 上。**
+一次拉 1800 根 K 线，光 `JSON.parse` 就可能吃掉大半个 CPU 预算。
+→ **冷启动回补由 TUI 完成**（本地无 CPU 限制），拉到后分批 POST 给 Worker 落库。
+→ **Cron 只做每日增量追加** —— 收盘后每标的每周期新增 1 根，payload 极小，10 ms 绰绰有余。
+
+这条修正很关键：原设计里「Cron 负责补历史」是错的，只有「Cron 负责每日追加」才成立。
 
 ### 2. Workers KV 每天只能写 **1000 次**
 
@@ -53,9 +63,12 @@
 ### WebSocket 是免费版少数「不打折」的能力
 
 普通 Worker 的 WebSocket 最省额度：升级握手算 **1 次请求**，之后**消息不计费、时长不计费**。
-（DO 的 WebSocket 则把每条消息都计入 DO 的 100,000/天。）
 
-**推论：TUI 的长连接走普通 Worker WebSocket，不要走 DO。**
+DO 的情况需要修正一处：DO 计费脚注写明「There is no charge for outgoing WebSocket messages」——
+**出站消息不计费**，只有入站消息计入 DO 的 100,000/天。所以 DO 推送并不像初版写的那么贵。
+
+**但推论不变：TUI 的长连接走普通 Worker WebSocket。** 因为 DO 真正的问题是 10 ms CPU 和
+duration 额度，不是消息计费。
 
 ### Workers AI 的 10,000 neurons 有多少
 
@@ -92,3 +105,19 @@
 
 **核心思想：Worker 是存储层和代理层，不是计算层。**
 即使 Worker 挂掉或额度耗尽，TUI 依然能直连数据源看盘 —— 这是免费版下正确的降级姿态。
+
+## 四、尚未验证的最大风险
+
+**本文所有数据源测试都是从一台日本住宅 IP 打的，没有一次来自真正的 Cloudflare Worker 出口。**
+
+Worker 用的是共享数据中心 IP，行为可能完全不同：
+
+- Yahoo 已被证实对数据中心 IP 极度敌视（第一个请求就 429）
+- 腾讯/新浪对海外数据中心 IP 段是否有额外限制，未知
+- 东财已确认封禁，Worker 只会更早触发
+
+**这个风险由架构本身化解**：既然实时行情由 TUI 直连（住宅 IP），Worker 只做落库和 LLM 代理，
+那么数据源对 Worker IP 的态度就只影响每日增量追加这一条路径。真到不行，追加也可以由 TUI 完成，
+Worker 退化为纯存储。
+
+**但仍需在实现第一步就实测验证**，不要等到设计全部落地才发现 Worker 拉不到数据。
