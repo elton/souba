@@ -8,6 +8,9 @@ use crate::core::symbol::Symbol;
 #[derive(Debug, Clone)]
 pub struct WatchItem {
     pub symbol: Symbol,
+    /// 库里缓存的名称。当前渲染用的是行情响应里的实时名称，
+    /// 这个字段是为了离线时（拉不到行情）仍能显示名字 —— 阶段 2 接。
+    #[allow(dead_code)]
     pub name: String,
 }
 
@@ -47,6 +50,7 @@ impl Store {
         Self::from_conn(Connection::open(path)?)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         Self::from_conn(Connection::open_in_memory()?)
     }
@@ -100,6 +104,8 @@ impl Store {
         Ok(())
     }
 
+    /// 阶段 2 的 d 键会调用它。现在自选股靠 seed 预置，还没有删除入口。
+    #[allow(dead_code)]
     pub fn remove(&self, symbol: &Symbol) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("store 锁中毒");
         conn.execute(

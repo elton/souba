@@ -30,6 +30,8 @@ impl Throttle {
         }
     }
 
+    /// 仅测试使用：退避是内部状态，生产代码不该依赖它做判断
+    #[cfg(test)]
     pub fn current_backoff(&self) -> Duration {
         backoff_for(self.state.lock().expect("throttle 锁中毒").failures)
     }

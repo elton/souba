@@ -8,16 +8,24 @@ pub struct Quote {
     pub symbol: Symbol,
     pub name: String,
     pub last: Decimal,
+    // 以下四项阶段 1 的表格没显示，阶段 2 画 K 线和算指标时要用。
+    // 现在就解析出来是因为它们本来就在同一个响应里，丢掉再拉一次不合理。
+    #[allow(dead_code)]
     pub prev_close: Decimal,
+    #[allow(dead_code)]
     pub open: Decimal,
+    #[allow(dead_code)]
     pub high: Decimal,
+    #[allow(dead_code)]
     pub low: Decimal,
+    #[allow(dead_code)]
     pub volume: Decimal,
     pub change: Decimal,
     pub change_pct: Decimal,
     /// 数据源给的时间戳，已按该市场的 quote_timezone 归一到 UTC
     pub stamped_at: DateTime<Utc>,
-    /// 哪个源给的 —— UI 必须能显示
+    /// 哪个源给的 —— 阶段 3 有降级链后 UI 必须显示它
+    #[allow(dead_code)]
     pub source: &'static str,
 }
 
