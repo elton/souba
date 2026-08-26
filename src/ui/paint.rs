@@ -14,6 +14,61 @@ pub const LINE_A: Rgb = Rgb(235, 235, 235);
 pub const LINE_B: Rgb = Rgb(235, 200, 60);
 pub const LINE_C: Rgb = Rgb(200, 90, 220);
 pub const AXIS: Rgb = Rgb(90, 90, 90);
+/// 网格线。要能看见但不能抢眼 —— 它是背景参考，不是内容。
+pub const GRID: Rgb = Rgb(70, 76, 88);
+
+/// 网格规格。横线按价格刻度的档位走，竖线贴在时间刻度上，
+/// 这样网格和坐标轴数字是对齐的 —— 不对齐的网格只会添乱。
+#[derive(Debug, Clone, Copy)]
+pub struct Grid<'a> {
+    /// 竖线画在第几根 K 线上（可视窗口内的下标）
+    pub v_at: &'a [usize],
+    /// 横线分成几档（含首尾）。0 表示不画横线。
+    pub h_lines: usize,
+}
+
+/// 虚线密度：每 4 个像素画 2 个。实线会盖过蜡烛的细影线。
+const DASH_ON: u32 = 2;
+const DASH_PERIOD: u32 = 4;
+
+// 网格是最先画的，底下没有内容，所以用满 alpha —— 半透明在空画布上
+// 反而会混出一个不确定的颜色，既不好测也没好处。
+fn dashed_h(c: &mut Canvas, y: i64, color: Rgb) {
+    for x in 0..c.w {
+        if x % DASH_PERIOD < DASH_ON {
+            c.set(x as i64, y, color);
+        }
+    }
+}
+
+fn dashed_v(c: &mut Canvas, x: i64, color: Rgb) {
+    for y in 0..c.h {
+        if y % DASH_PERIOD < DASH_ON {
+            c.set(x, y as i64, color);
+        }
+    }
+}
+
+/// 画网格。**必须在蜡烛之前调用** —— 网格是背景，压在数据上就本末倒置了。
+pub fn grid(c: &mut Canvas, vs: VScale, g: &Grid, bar_count: usize) {
+    if c.w == 0 || c.h == 0 {
+        return;
+    }
+    if g.h_lines >= 2 {
+        for i in 0..g.h_lines {
+            let frac = i as f64 / (g.h_lines - 1) as f64;
+            let price = vs.max - (vs.max - vs.min) * frac;
+            dashed_h(c, vs.y(price) as i64, GRID);
+        }
+    }
+    if bar_count > 0 {
+        let (step, body) = layout(c.w, bar_count);
+        for idx in g.v_at {
+            let x = (*idx as f64 * step + body as f64 / 2.0).round() as i64;
+            dashed_v(c, x, GRID);
+        }
+    }
+}
 
 /// 纵向价格映射
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +118,7 @@ pub fn layout(canvas_w: u32, bar_count: usize) -> (f64, u32) {
 /// 画蜡烛图，返回用到的价格映射（调用方据此画刻度）
 /// 画蜡烛图。`bars` 就是要显示的那一段，由调用方按视口切好 ——
 /// 这里不再自己截取，避免「视口说显示 A 段、绘图却画了 B 段」。
-pub fn candles(c: &mut Canvas, bars: &[Bar]) -> Option<VScale> {
+pub fn candles(c: &mut Canvas, bars: &[Bar], g: Option<&Grid>) -> Option<VScale> {
     if bars.is_empty() || c.w == 0 || c.h == 0 {
         return None;
     }
@@ -72,6 +127,11 @@ pub fn candles(c: &mut Canvas, bars: &[Bar]) -> Option<VScale> {
     let min = bars.iter().fold(f64::MAX, |a, b| a.min(b.low));
     let max = bars.iter().fold(f64::MIN, |a, b| a.max(b.high));
     let vs = VScale::new(min, max, c.h);
+
+    // 先画网格，蜡烛盖在上面
+    if let Some(g) = g {
+        grid(c, vs, g, bars.len());
+    }
 
     for (i, b) in bars.iter().enumerate() {
         let x = (i as f64 * step).round() as i64;
@@ -105,7 +165,7 @@ fn line(c: &mut Canvas, values: &[f64], step: f64, vs: VScale, color: Rgb, width
 /// MACD：柱状体 + DIF/DEA
 /// MACD 面板。`m` 已经是按视口切好的那一段（但指标本身要在**全量**数据上
 /// 算完再切，否则窗口左边缘的值会因缺少预热而失真）。
-pub fn macd(c: &mut Canvas, m: &Macd) {
+pub fn macd(c: &mut Canvas, m: &Macd, v_at: &[usize]) {
     if m.hist.is_empty() || c.w == 0 || c.h == 0 {
         return;
     }
@@ -126,11 +186,14 @@ pub fn macd(c: &mut Canvas, m: &Macd) {
     let hi = all.iter().fold(f64::MIN, |a, b| a.max(*b));
     let vs = VScale::new(lo, hi, c.h);
 
-    // 零轴
+    // 竖线与主图对齐，方便把 MACD 的拐点对到日期上
+    grid(c, vs, &Grid { v_at, h_lines: 0 }, m.hist.len());
+
+    // 零轴比网格显眼一点 —— MACD 的正负分界是要读的
     let zero_y = vs.y(0.0);
     for x in 0..c.w {
         if x % 3 == 0 {
-            c.blend(x as i64, zero_y as i64, AXIS, 0.6);
+            c.blend(x as i64, zero_y as i64, AXIS, 0.8);
         }
     }
 
@@ -153,17 +216,19 @@ pub fn macd(c: &mut Canvas, m: &Macd) {
 }
 
 /// KDJ：纵轴固定 0–100，另画 20/50/80 三条参考线
-pub fn kdj(c: &mut Canvas, k: &Kdj) {
+pub fn kdj(c: &mut Canvas, k: &Kdj, v_at: &[usize]) {
     if k.k.is_empty() || c.w == 0 || c.h == 0 {
         return;
     }
     let (step, _) = layout(c.w, k.k.len());
     let vs = VScale::new(0.0, 100.0, c.h);
+    grid(c, vs, &Grid { v_at, h_lines: 0 }, k.k.len());
+    // 20/50/80 是 KDJ 的超买超卖参考位，比普通网格显眼
     for lvl in [20.0, 50.0, 80.0] {
         let y = vs.y(lvl) as i64;
         for x in 0..c.w {
             if x % 4 == 0 {
-                c.blend(x as i64, y, AXIS, 0.5);
+                c.blend(x as i64, y, AXIS, 0.7);
             }
         }
     }
@@ -241,7 +306,7 @@ mod tests {
     #[test]
     fn 蜡烛画出内容() {
         let mut c = Canvas::new(400, 200);
-        assert!(candles(&mut c, &bars(120)).is_some());
+        assert!(candles(&mut c, &bars(120), None).is_some());
         assert!(painted(&c) > 1000, "画出的像素太少：{}", painted(&c));
     }
 
@@ -253,14 +318,14 @@ mod tests {
             open: 10.0, high: 10.0, low: 10.0, close: 10.0, volume: 1.0,
         };
         let mut c = Canvas::new(60, 40);
-        candles(&mut c, &[flat]).unwrap();
+        candles(&mut c, &[flat], None).unwrap();
         assert!(painted(&c) > 0, "一字板整根消失了");
     }
 
     #[test]
     fn 空数据不画也不panic() {
         let mut c = Canvas::new(100, 50);
-        assert!(candles(&mut c, &[]).is_none());
+        assert!(candles(&mut c, &[], None).is_none());
         assert_eq!(painted(&c), 0);
     }
 
@@ -272,7 +337,7 @@ mod tests {
         };
         let down = Bar { close: 9.5, ..up };
         let mut c = Canvas::new(60, 40);
-        candles(&mut c, &[up, down]).unwrap();
+        candles(&mut c, &[up, down], None).unwrap();
         let has = |col: Rgb| {
             (0..c.h)
                 .flat_map(|y| (0..c.w).map(move |x| (x, y)))
@@ -286,7 +351,7 @@ mod tests {
         let closes: Vec<f64> = bars(200).iter().map(|b| b.close).collect();
         let m = crate::core::indicator::macd(&closes, 12, 26, 9);
         let mut c = Canvas::new(600, 120);
-        macd(&mut c, &m);
+        macd(&mut c, &m, &[]);
         let colors: std::collections::HashSet<(u8, u8, u8)> = (0..c.h)
             .flat_map(|y| (0..c.w).map(move |x| (x, y)))
             .filter_map(|(x, y)| c.color_at(x, y))
@@ -299,8 +364,64 @@ mod tests {
     fn kdj画出参考线和三条曲线() {
         let k = crate::core::indicator::kdj(&bars(200), 9, 3.0, 3.0);
         let mut c = Canvas::new(600, 120);
-        kdj(&mut c, &k);
+        kdj(&mut c, &k, &[]);
         assert!(painted(&c) > 500);
+    }
+
+    #[test]
+    fn 网格画在蜡烛下层不覆盖数据() {
+        // 网格是背景参考，压在数据上就本末倒置
+        let bs = bars(60);
+        let mut with_grid = Canvas::new(400, 200);
+        candles(&mut with_grid, &bs, Some(&Grid { v_at: &[0, 30, 59], h_lines: 5 })).unwrap();
+        let mut no_grid = Canvas::new(400, 200);
+        candles(&mut no_grid, &bs, None).unwrap();
+
+        // 无网格版本里画到的每一个像素，有网格版本必须是同样的颜色
+        for y in 0..200u32 {
+            for x in 0..400u32 {
+                if let Some(c0) = no_grid.color_at(x, y) {
+                    assert_eq!(
+                        with_grid.color_at(x, y),
+                        Some(c0),
+                        "({x},{y}) 的蜡烛被网格盖掉了"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 网格确实画了东西() {
+        let bs = bars(60);
+        let mut c = Canvas::new(400, 200);
+        candles(&mut c, &bs, Some(&Grid { v_at: &[0, 30, 59], h_lines: 5 })).unwrap();
+        let grid_px = (0..200u32)
+            .flat_map(|y| (0..400u32).map(move |x| (x, y)))
+            .filter(|(x, y)| c.color_at(*x, *y) == Some(GRID))
+            .count();
+        assert!(grid_px > 200, "网格像素太少：{grid_px}");
+    }
+
+    #[test]
+    fn 网格是虚线不是实线() {
+        // 实线会盖过蜡烛的细影线，视觉上很吵
+        let mut c = Canvas::new(200, 100);
+        grid(&mut c, VScale::new(0.0, 100.0, 100), &Grid { v_at: &[], h_lines: 3 }, 10);
+        let row_y = (0..100u32).find(|y| (0..200u32).any(|x| c.is_set(x, *y))).unwrap();
+        let on = (0..200u32).filter(|x| c.is_set(*x, row_y)).count();
+        assert!(on > 0 && on < 200, "整行 200 像素画了 {on} 个 —— 应是虚线");
+    }
+
+    #[test]
+    fn 不给网格时一个网格像素都没有() {
+        let mut c = Canvas::new(200, 100);
+        candles(&mut c, &bars(30), None).unwrap();
+        let grid_px = (0..100u32)
+            .flat_map(|y| (0..200u32).map(move |x| (x, y)))
+            .filter(|(x, y)| c.color_at(*x, *y) == Some(GRID))
+            .count();
+        assert_eq!(grid_px, 0);
     }
 
     #[test]
@@ -311,11 +432,11 @@ mod tests {
         let kd = crate::core::indicator::kdj(&bs, 9, 3.0, 3.0);
         for (w, h) in [(1u32, 1u32), (10, 4), (80, 40), (2800, 800), (40, 2000)] {
             let mut c = Canvas::new(w, h);
-            let _ = candles(&mut c, &bs);
+            let _ = candles(&mut c, &bs, Some(&Grid { v_at: &[0, 50, 299], h_lines: 5 }));
             let mut c2 = Canvas::new(w, h);
-            macd(&mut c2, &m);
+            macd(&mut c2, &m, &[0, 100, 299]);
             let mut c3 = Canvas::new(w, h);
-            kdj(&mut c3, &kd);
+            kdj(&mut c3, &kd, &[0, 100, 299]);
         }
     }
 }

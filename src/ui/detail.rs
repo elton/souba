@@ -104,9 +104,22 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     let plot = Rect::new(inner.x, inner.y, inner.width.saturating_sub(axis_w), body_h);
     let axis = Rect::new(inner.x + plot.width, inner.y, axis_w, body_h);
 
+    // 竖线贴在时间刻度上、横线用价格刻度的档位 —— 网格与坐标轴数字对齐，
+    // 才谈得上「参考」，不然只是花纹。
+    let tz = v.symbol.market.timezone();
+    let tick_idx: Vec<usize> = timeaxis::ticks(window, v.timeframe, tz, plot.width)
+        .iter()
+        .map(|t| t.index)
+        .collect();
+    let price_levels = if plot.height >= 9 { 5 } else { 2 };
+    let g = paint::Grid {
+        v_at: &tick_idx,
+        h_lines: price_levels,
+    };
+
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
-        vscale = paint::candles(c, window);
+        vscale = paint::candles(c, window, Some(&g));
     });
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
@@ -144,7 +157,7 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
                 dea: full.dea[lo..hi].to_vec(),
                 hist: full.hist[lo..hi].to_vec(),
             };
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m));
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m, &tick_idx));
         }
         IndicatorKind::Kdj => {
             let full = kdj(bars, 9, 3.0, 3.0);
@@ -153,7 +166,7 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
                 d: full.d[lo..hi].to_vec(),
                 j: full.j[lo..hi].to_vec(),
             };
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k));
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k, &tick_idx));
         }
     }
 }
@@ -197,6 +210,7 @@ fn render_price_axis(frame: &mut Frame, area: Rect, scale: paint::VScale) {
     // 行数够就画 5 档，不够就退到首尾两档
     // 之前用 DarkGray，在深色背景上几乎看不见 —— 刻度是要读数的，不是装饰
     let ticks = if area.height >= 9 { 5 } else { 2 };
+    debug_assert!(ticks >= 2, "刻度档数要与网格横线档数保持一致");
     let style = Style::default()
         .fg(Color::Gray)
         .add_modifier(Modifier::BOLD);
