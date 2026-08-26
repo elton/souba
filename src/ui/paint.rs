@@ -46,77 +46,76 @@ impl VScale {
     }
 }
 
-/// 每根 K 线占多少像素。至少留 1 像素间隔，否则糊成一片。
-pub fn layout(canvas_w: u32, bar_count: usize) -> (u32, u32) {
-    if bar_count == 0 {
-        return (3, 2);
+/// 传进来的这一段 K 线**精确铺满**画布宽度。
+///
+/// 返回 (第 i 根的左边缘 x, 实体宽度)。用浮点步距而不是整数 ——
+/// 整数步距会把余量堆在一侧形成空白条，那是个很显眼的 bug。
+pub fn layout(canvas_w: u32, bar_count: usize) -> (f64, u32) {
+    if bar_count == 0 || canvas_w == 0 {
+        return (3.0, 2);
     }
-    let step = (canvas_w / bar_count.max(1) as u32).clamp(2, 14);
-    // 实体宽度占 step 的 2/3，其余留白；至少 1 像素
-    let body = ((step * 2) / 3).max(1);
+    let step = canvas_w as f64 / bar_count as f64;
+    // 实体占步距的 2/3，其余留白；至少 1 像素，否则蜡烛消失
+    let body = ((step * 2.0 / 3.0).floor() as u32).max(1);
     (step, body)
 }
 
 /// 画蜡烛图，返回用到的价格映射（调用方据此画刻度）
+/// 画蜡烛图。`bars` 就是要显示的那一段，由调用方按视口切好 ——
+/// 这里不再自己截取，避免「视口说显示 A 段、绘图却画了 B 段」。
 pub fn candles(c: &mut Canvas, bars: &[Bar]) -> Option<VScale> {
     if bars.is_empty() || c.w == 0 || c.h == 0 {
         return None;
     }
     let (step, body_w) = layout(c.w, bars.len());
-    let n = ((c.w / step) as usize).min(bars.len()).max(1);
-    let shown = &bars[bars.len() - n..];
 
-    let min = shown.iter().fold(f64::MAX, |a, b| a.min(b.low));
-    let max = shown.iter().fold(f64::MIN, |a, b| a.max(b.high));
+    let min = bars.iter().fold(f64::MAX, |a, b| a.min(b.low));
+    let max = bars.iter().fold(f64::MIN, |a, b| a.max(b.high));
     let vs = VScale::new(min, max, c.h);
 
-    let used = n as u32 * step;
-    let left = c.w.saturating_sub(used);
-    for (i, b) in shown.iter().enumerate() {
-        let x = left + i as u32 * step;
+    for (i, b) in bars.iter().enumerate() {
+        let x = (i as f64 * step).round() as i64;
         let color = if b.close >= b.open { UP } else { DOWN };
         // 影线画在实体中线上
-        let mid = x + body_w / 2;
-        c.v_line(mid as i64, vs.y(b.high) as i64, vs.y(b.low) as i64, color);
+        c.v_line(
+            x + (body_w / 2) as i64,
+            vs.y(b.high) as i64,
+            vs.y(b.low) as i64,
+            color,
+        );
         // 实体；开收相等（一字板）时至少画 1 像素高，否则整根消失
         let (yt, yb) = (vs.y(b.open.max(b.close)), vs.y(b.open.min(b.close)));
         let h = ((yb - yt).round() as i64).max(1);
-        c.fill_rect(x as i64, yt as i64, body_w as i64, h, color);
+        c.fill_rect(x, yt as i64, body_w as i64, h, color);
     }
     Some(vs)
 }
 
-/// 把一条序列画成折线。右对齐到画布右端，与蜡烛同步。
-fn line(c: &mut Canvas, values: &[f64], step: u32, vs: VScale, color: Rgb, width: u32) {
-    if values.is_empty() {
-        return;
-    }
-    let n = ((c.w / step.max(1)) as usize).min(values.len()).max(1);
-    let shown = &values[values.len() - n..];
-    let left = c.w.saturating_sub(n as u32 * step);
-    let pts: Vec<(f32, f32)> = shown
+/// 把一条序列画成折线，与蜡烛用同一套横坐标。
+fn line(c: &mut Canvas, values: &[f64], step: f64, vs: VScale, color: Rgb, width: u32) {
+    let pts: Vec<(f32, f32)> = values
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite())
-        .map(|(i, v)| ((left + i as u32 * step + step / 2) as f32, vs.y(*v)))
+        .map(|(i, v)| ((i as f64 * step + step / 2.0) as f32, vs.y(*v)))
         .collect();
     c.polyline(&pts, color, width);
 }
 
 /// MACD：柱状体 + DIF/DEA
-pub fn macd(c: &mut Canvas, m: &Macd, bar_count: usize) {
+/// MACD 面板。`m` 已经是按视口切好的那一段（但指标本身要在**全量**数据上
+/// 算完再切，否则窗口左边缘的值会因缺少预热而失真）。
+pub fn macd(c: &mut Canvas, m: &Macd) {
     if m.hist.is_empty() || c.w == 0 || c.h == 0 {
         return;
     }
-    let (step, body_w) = layout(c.w, bar_count.max(m.hist.len()));
-    let n = ((c.w / step) as usize).min(m.hist.len()).max(1);
-    let take = |v: &[f64]| v[v.len().saturating_sub(n)..].to_vec();
-    let (hist, dif, dea) = (take(&m.hist), take(&m.dif), take(&m.dea));
+    let (step, body_w) = layout(c.w, m.hist.len());
+    let (hist, dif, dea) = (&m.hist, &m.dif, &m.dea);
 
     let all: Vec<f64> = hist
         .iter()
-        .chain(&dif)
-        .chain(&dea)
+        .chain(dif)
+        .chain(dea)
         .copied()
         .filter(|v| v.is_finite())
         .collect();
@@ -135,12 +134,11 @@ pub fn macd(c: &mut Canvas, m: &Macd, bar_count: usize) {
         }
     }
 
-    let left = c.w.saturating_sub(n as u32 * step);
     for (i, v) in hist.iter().enumerate() {
         if !v.is_finite() {
             continue;
         }
-        let x = left + i as u32 * step;
+        let x = (i as f64 * step).round() as i64;
         let color = if *v >= 0.0 { UP } else { DOWN };
         let y = vs.y(*v);
         let (top, h) = if y < zero_y {
@@ -148,18 +146,18 @@ pub fn macd(c: &mut Canvas, m: &Macd, bar_count: usize) {
         } else {
             (zero_y, (y - zero_y).max(1.0))
         };
-        c.fill_rect(x as i64, top as i64, body_w as i64, h.round() as i64, color);
+        c.fill_rect(x, top as i64, body_w as i64, h.round() as i64, color);
     }
-    line(c, &dea, step, vs, LINE_B, 1);
-    line(c, &dif, step, vs, LINE_A, 1);
+    line(c, dea, step, vs, LINE_B, 2);
+    line(c, dif, step, vs, LINE_A, 2);
 }
 
 /// KDJ：纵轴固定 0–100，另画 20/50/80 三条参考线
-pub fn kdj(c: &mut Canvas, k: &Kdj, bar_count: usize) {
+pub fn kdj(c: &mut Canvas, k: &Kdj) {
     if k.k.is_empty() || c.w == 0 || c.h == 0 {
         return;
     }
-    let (step, _) = layout(c.w, bar_count.max(k.k.len()));
+    let (step, _) = layout(c.w, k.k.len());
     let vs = VScale::new(0.0, 100.0, c.h);
     for lvl in [20.0, 50.0, 80.0] {
         let y = vs.y(lvl) as i64;
@@ -169,9 +167,9 @@ pub fn kdj(c: &mut Canvas, k: &Kdj, bar_count: usize) {
             }
         }
     }
-    line(c, &k.j, step, vs, LINE_C, 1);
-    line(c, &k.d, step, vs, LINE_B, 1);
-    line(c, &k.k, step, vs, LINE_A, 1);
+    line(c, &k.j, step, vs, LINE_C, 2);
+    line(c, &k.d, step, vs, LINE_B, 2);
+    line(c, &k.k, step, vs, LINE_A, 2);
 }
 
 #[cfg(test)]
@@ -213,15 +211,31 @@ mod tests {
     #[test]
     fn 蜡烛之间有间隔() {
         let (step, body) = layout(1000, 100);
-        assert!(body < step, "实体宽度必须小于步距，否则挨在一起");
-        assert!(step - body >= 1, "至少留 1 像素间隔");
+        assert!((body as f64) < step, "实体宽度必须小于步距，否则挨在一起");
+        assert!(step - body as f64 >= 1.0, "至少留 1 像素间隔");
     }
 
     #[test]
-    fn 间隔随空间自适应但有上下限() {
-        assert_eq!(layout(100, 1000).0, 2, "数据密集时压到最小步距");
-        assert_eq!(layout(10000, 10).0, 14, "空间极富余时步距封顶");
-        assert_eq!(layout(0, 0), (3, 2), "退化输入不 panic");
+    fn 精确铺满画布宽度不留空白条() {
+        // 之前用整数步距，余量堆在一侧形成一条明显的空白 —— 那是个显眼的 bug
+        for (w, n) in [(4160u32, 1500usize), (1000, 7), (333, 100), (2000, 2000)] {
+            let (step, _) = layout(w, n);
+            let last_right = (n - 1) as f64 * step;
+            let unused = w as f64 - last_right;
+            assert!(
+                unused <= step + 1.0,
+                "{w}px 画 {n} 根，右端剩了 {unused:.1}px 没用，说明没铺满"
+            );
+            assert!(step > 0.0);
+        }
+    }
+
+    #[test]
+    fn 退化输入不panic() {
+        assert_eq!(layout(0, 0), (3.0, 2));
+        assert_eq!(layout(100, 0), (3.0, 2));
+        let (step, body) = layout(10, 1000);
+        assert!(step > 0.0 && body >= 1, "根数远多于像素时实体也要保底 1 像素");
     }
 
     #[test]
@@ -272,7 +286,7 @@ mod tests {
         let closes: Vec<f64> = bars(200).iter().map(|b| b.close).collect();
         let m = crate::core::indicator::macd(&closes, 12, 26, 9);
         let mut c = Canvas::new(600, 120);
-        macd(&mut c, &m, 200);
+        macd(&mut c, &m);
         let colors: std::collections::HashSet<(u8, u8, u8)> = (0..c.h)
             .flat_map(|y| (0..c.w).map(move |x| (x, y)))
             .filter_map(|(x, y)| c.color_at(x, y))
@@ -285,7 +299,7 @@ mod tests {
     fn kdj画出参考线和三条曲线() {
         let k = crate::core::indicator::kdj(&bars(200), 9, 3.0, 3.0);
         let mut c = Canvas::new(600, 120);
-        kdj(&mut c, &k, 200);
+        kdj(&mut c, &k);
         assert!(painted(&c) > 500);
     }
 
@@ -299,9 +313,9 @@ mod tests {
             let mut c = Canvas::new(w, h);
             let _ = candles(&mut c, &bs);
             let mut c2 = Canvas::new(w, h);
-            macd(&mut c2, &m, 300);
+            macd(&mut c2, &m);
             let mut c3 = Canvas::new(w, h);
-            kdj(&mut c3, &kd, 300);
+            kdj(&mut c3, &kd);
         }
     }
 }

@@ -166,9 +166,12 @@ async fn run(
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
     backend: Backend,
 ) -> anyhow::Result<()> {
-    type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind, (u16, u16), usize);
+    type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind,
+                  crate::ui::viewport::Viewport, (u16, u16), usize);
     let mut last_stamp: Stamp = (Screen::Watchlist, usize::MAX, Timeframe::Day,
-                                 crate::ui::detail::IndicatorKind::Macd, (0, 0), usize::MAX);
+                                 crate::ui::detail::IndicatorKind::Macd,
+                                 crate::ui::viewport::Viewport { span: 0, offset: usize::MAX },
+                                 (0, 0), usize::MAX);
     while !app.should_quit {
         if app.bars_dirty {
             app.bars_dirty = false;
@@ -184,7 +187,7 @@ async fn run(
         terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state, &mut surface))?;
         // 位图叠在字符层之上，必须在 ratatui 画完之后才发。
         // ratatui 只重绘变化的格子，所以图不会被每帧擦掉 —— 但内容变了要重发。
-        let stamp = (app.screen, app.selected, app.timeframe, app.indicator,
+        let stamp = (app.screen, app.selected, app.timeframe, app.indicator, app.viewport,
                      terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
                      bar_len(&bar_state));
         if let Some(seq) = surface.escape.take() {
@@ -201,7 +204,7 @@ async fn run(
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(k) = event::read()?
         {
-            app.on_key(k, watch.len());
+            app.on_key_with(k, watch.len(), bar_len(&bar_state));
         }
     }
     Ok(())
@@ -271,12 +274,16 @@ fn draw(
                         timeframe: app.timeframe,
                         indicator: app.indicator,
                         bars: &state,
+                        viewport: app.viewport,
+                        surface_label: surface.backend.label(),
                     },
                     surface,
                 );
             }
             frame.render_widget(
-                Paragraph::new(" ←→/Tab 切周期   ↑↓ 切标的   i 切指标   Esc/q 返回")
+                Paragraph::new(
+                    " ←→ 滚动   =- 缩放   Home/End 首尾   Tab 切周期   ↑↓ 切标的   i 切指标   Esc 返回",
+                )
                     .style(Style::default().fg(Color::DarkGray)),
                 panes.footer,
             );

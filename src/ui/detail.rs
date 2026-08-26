@@ -7,11 +7,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::core::bar::{Bar, Timeframe};
-use crate::core::indicator::{kdj, macd};
+use crate::core::indicator::{Kdj, Macd, kdj, macd};
 use crate::core::quote::Quote;
 use crate::core::symbol::Symbol;
 use crate::ui::paint;
 use crate::ui::surface::Surface;
+use crate::ui::viewport::Viewport;
 
 /// 详情面板要显示的指标
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,9 @@ pub struct DetailView<'a> {
     pub timeframe: Timeframe,
     pub indicator: IndicatorKind,
     pub bars: &'a BarState,
+    pub viewport: Viewport,
+    /// 当前绘图后端的名字，显示在标题里
+    pub surface_label: &'static str,
 }
 
 pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surface) {
@@ -73,20 +77,21 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
 
     // 右侧留出独立的价格轴栏位 —— 否则刻度文字会盖掉蜡烛
     const AXIS_W: u16 = 10;
-    let plot_w = chart_area.width.saturating_sub(AXIS_W + 2);
-    let (step, _) = paint::layout(
-        surface.backend.canvas_size(Rect::new(0, 0, plot_w, 1)).0,
-        bars.len(),
-    );
-    let cw = surface.backend.canvas_size(Rect::new(0, 0, plot_w, 1)).0;
-    let shown = ((cw / step.max(1)) as usize).min(bars.len());
+    let (lo, hi) = v.viewport.range(bars.len());
+    let window = &bars[lo..hi];
 
+    let pos = if v.viewport.at_latest() {
+        "最新".to_string()
+    } else {
+        format!("←{} 根前", bars.len() - hi)
+    };
     let chart_block = Block::default().borders(Borders::ALL).title(format!(
-        " {} · 显示 {} / 共 {} 根 · {} ",
+        " {} · {} 根 / 共 {} · {} · {} ",
         v.timeframe.label(),
-        shown,
+        window.len(),
         bars.len(),
-        surface.backend.label()
+        pos,
+        v.surface_label
     ));
     let inner = chart_block.inner(chart_area);
     frame.render_widget(chart_block, chart_area);
@@ -97,7 +102,7 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
 
     let mut vscale = None;
     surface.draw(plot, frame.buffer_mut(), |c| {
-        vscale = paint::candles(c, bars);
+        vscale = paint::candles(c, window);
     });
     if let Some(vs) = vscale {
         render_price_axis(frame, axis, vs);
@@ -108,23 +113,34 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
         .title(format!(" {} ", v.indicator.label()));
     let ind_inner = ind_block.inner(ind_area);
     frame.render_widget(ind_block, ind_area);
-    // 指标面板与 K 线共用同一条右侧留白，纵向刻度对齐
+    // 指标面板与 K 线共用同一条右侧留白，横坐标才对得齐
     let ind_plot = Rect::new(
         ind_inner.x,
         ind_inner.y,
         ind_inner.width.saturating_sub(axis_w),
         ind_inner.height,
     );
-    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let n = bars.len();
+    // 指标必须在**全量**数据上算完再按视口切 —— 只拿窗口内的数据算，
+    // 左边缘会因为缺少预热而失真（MACD 要 26+9 根、EMA576 要上千根）。
     match v.indicator {
         IndicatorKind::Macd => {
-            let m = macd(&closes, 12, 26, 9);
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m, n));
+            let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+            let full = macd(&closes, 12, 26, 9);
+            let m = Macd {
+                dif: full.dif[lo..hi].to_vec(),
+                dea: full.dea[lo..hi].to_vec(),
+                hist: full.hist[lo..hi].to_vec(),
+            };
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::macd(c, &m));
         }
         IndicatorKind::Kdj => {
-            let k = kdj(bars, 9, 3.0, 3.0);
-            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k, n));
+            let full = kdj(bars, 9, 3.0, 3.0);
+            let k = Kdj {
+                k: full.k[lo..hi].to_vec(),
+                d: full.d[lo..hi].to_vec(),
+                j: full.j[lo..hi].to_vec(),
+            };
+            surface.draw(ind_plot, frame.buffer_mut(), |c| paint::kdj(c, &k));
         }
     }
 }
@@ -135,8 +151,11 @@ fn render_price_axis(frame: &mut Frame, area: Rect, scale: paint::VScale) {
         return;
     }
     // 行数够就画 5 档，不够就退到首尾两档
+    // 之前用 DarkGray，在深色背景上几乎看不见 —— 刻度是要读数的，不是装饰
     let ticks = if area.height >= 9 { 5 } else { 2 };
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
     for i in 0..ticks {
         let frac = i as f64 / (ticks - 1).max(1) as f64;
         let price = scale.max - (scale.max - scale.min) * frac;
@@ -267,11 +286,25 @@ mod axis_tests {
         draw_with(w, h, n, crate::ui::surface::Backend::Braille)
     }
 
+    fn draw_vp(w: u16, h: u16, n: usize, vp: Viewport) -> ratatui::buffer::Buffer {
+        draw_full(w, h, n, crate::ui::surface::Backend::Braille, vp)
+    }
+
     fn draw_with(
         w: u16,
         h: u16,
         n: usize,
         backend: crate::ui::surface::Backend,
+    ) -> ratatui::buffer::Buffer {
+        draw_full(w, h, n, backend, Viewport::default())
+    }
+
+    fn draw_full(
+        w: u16,
+        h: u16,
+        n: usize,
+        backend: crate::ui::surface::Backend,
+        vp: Viewport,
     ) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut surface = Surface::new(backend);
@@ -287,6 +320,8 @@ mod axis_tests {
                     timeframe: Timeframe::Day,
                     indicator: IndicatorKind::Macd,
                     bars: &state,
+                    viewport: vp,
+                    surface_label: backend.label(),
                 },
                 &mut surface,
             )
@@ -333,31 +368,40 @@ mod axis_tests {
     }
 
     #[test]
-    fn 标题区分显示根数与加载根数() {
+    fn 标题写明可视根数与总根数() {
         let t = text(&draw(120, 40, 1500), 120, 40);
-        assert!(t.contains("共 1500 根"), "应说明总共加载了多少");
-        assert!(t.contains("显示 "), "应说明实际显示了多少 —— 只说 1500 会误导");
-        assert!(!t.contains("显示 1500"), "120 列画不下 1500 根，显示数不该等于总数");
+        assert!(t.contains("共 1500"), "应说明总共加载了多少");
+        assert!(t.contains("250 根"), "默认视口是 250 根");
     }
 
     #[test]
-    fn 数据少于宽度时显示数等于总数() {
+    fn 数据少于视口时全部显示() {
         let t = text(&draw(200, 40, 50), 200, 40);
-        assert!(t.contains("显示 50 / 共 50 根"), "画得下就该显示全部");
+        assert!(t.contains("50 根 / 共 50"), "画得下就该显示全部");
     }
 
     #[test]
-    fn 蜡烛有间隔后显示根数要按间隔折算() {
-        // 每根占 2-3 列，所以 120 列画不下 120 根
+    fn 贴着最新时标注最新() {
         let t = text(&draw(120, 40, 1500), 120, 40);
-        assert!(!t.contains("显示 1500"), "显示数不该等于总数");
-        let shown: usize = t
-            .split("显示 ")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .and_then(|s| s.parse().ok())
-            .expect("标题里应有显示根数");
-        assert!(shown > 0 && shown < 120, "120 列按 2-3 列一根，显示数应远小于列数，实际 {shown}");
+        assert!(t.contains("最新"), "默认应贴在最新一根");
+    }
+
+    #[test]
+    fn 滚动后标注离最新多远() {
+        let mut vp = Viewport::default();
+        vp.pan_left(1500);
+        let t = text(&draw_vp(120, 40, 1500, vp), 120, 40);
+        assert!(!t.contains("· 最新 ·"), "滚走之后不该还说「最新」");
+        assert!(t.contains("根前"), "应标注离最新多远：{}", &t[..160.min(t.len())]);
+    }
+
+    #[test]
+    fn 缩放改变可视根数() {
+        let mut vp = Viewport::default();
+        vp.zoom_in(1500);
+        let (lo, hi) = vp.range(1500);
+        let t = text(&draw_vp(120, 40, 1500, vp), 120, 40);
+        assert!(t.contains(&format!("{} 根", hi - lo)), "标题应反映缩放后的根数");
     }
 
     #[test]
