@@ -1,4 +1,5 @@
 mod core;
+mod settings;
 mod source;
 mod store;
 mod ui;
@@ -64,9 +65,16 @@ async fn main() -> anyhow::Result<()> {
             "souba — 终端行情与策略终端\n\n\
              用法：\n  \
              souba              打开自选股列表\n  \
-             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700"
+             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700\n  \
+             souba set <键> <值>  修改策略与扫描参数\n  \
+             souba get <键>       查看某个参数的当前值与默认值\n  \
+             souba settings       列出全部参数"
         );
         return Ok(());
+    }
+    if let Some(cmd @ ("set" | "get" | "settings")) = arg.as_deref() {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return settings::run(cmd, &store, &rest);
     }
     let direct = match arg {
         Some(a) => Some(parse_cli_symbol(&a)?),

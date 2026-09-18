@@ -100,6 +100,24 @@ impl Store {
         Ok(())
     }
 
+    pub fn all_settings(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 覆盖写并刷新 updated_at —— D1 同步按它「最后写入者胜」
+    pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// 阶段 2 的 d 键会调用它。现在自选股靠 seed 预置，还没有删除入口。
     #[allow(dead_code)]
     pub fn remove(&self, symbol: &Symbol) -> anyhow::Result<()> {
@@ -159,6 +177,30 @@ mod tests {
         let list = st.watchlist().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "貴州茅台");
+    }
+
+    #[test]
+    fn 设置写入后能读回并刷新_updated_at() {
+        let st = Store::open_in_memory().unwrap();
+        st.set_setting("vegas.fast", "144,169").unwrap();
+        // 把时间戳抹成 0，再写一次，验证确实被刷新了
+        st.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE settings SET updated_at = 0", [])
+            .unwrap();
+        st.set_setting("vegas.fast", "89,144").unwrap();
+        assert_eq!(
+            st.all_settings().unwrap(),
+            vec![("vegas.fast".to_string(), "89,144".to_string())]
+        );
+        let ts: i64 = st
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT updated_at FROM settings", [], |r| r.get(0))
+            .unwrap();
+        assert!(ts > 0, "updated_at 没被刷新");
     }
 
     #[test]
