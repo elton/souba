@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::core::sector::{Member, Sector, Snapshot};
+use crate::core::sector::{Member, Sector, SectorKind, Snapshot};
 use crate::core::symbol::{Market, Symbol};
 use crate::core::adjust::{AdjFactor, apply_factors};
 use crate::core::bar::{Bar, Timeframe};
@@ -267,9 +267,7 @@ impl Store {
         Ok(())
     }
 
-    /// 当日结果，按板块码与名次升序。机会面板（07 票）是它的正经调用方，
-    /// 本票只写不读，所以读这条路先只给测试用。
-    #[cfg(test)]
+    /// 当日结果，按板块码与名次升序。机会面板直接读它。
     pub fn scan_results(&self, market: Market, date: &str) -> anyhow::Result<Vec<ScanRow>> {
         let conn = self.conn.lock().expect("store 锁中毒");
         let mut stmt = conn.prepare(
@@ -298,6 +296,50 @@ impl Store {
                 freshness,
                 facets_json,
             });
+        }
+        Ok(out)
+    }
+
+    /// 当日扫描覆盖到的板块，带名称、类型与当日快照。面板的板块列表读它 ——
+    /// `scan_results` 只有板块码，名称和热度分量都不在里面。
+    ///
+    /// 快照缺失（`sector_daily` 没有当天那行）时按 0 处理：那只说明热度算不出来，
+    /// 不该让整个面板打不开。
+    pub fn scan_sectors(
+        &self,
+        market: Market,
+        date: &str,
+    ) -> anyhow::Result<Vec<(String, String, SectorKind, Snapshot)>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT r.sector_code, s.name, s.kind,
+                    COALESCE(d.change_pct, 0.0), COALESCE(d.turnover, 0.0)
+             FROM scan_results r
+             JOIN sectors s ON s.market = r.market AND s.code = r.sector_code
+             LEFT JOIN sector_daily d
+               ON d.market = r.market AND d.sector_code = r.sector_code AND d.date = r.date
+             WHERE r.date = ?1 AND r.market = ?2
+             ORDER BY r.sector_code",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![date, market.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                Snapshot {
+                    change_pct: r.get(3)?,
+                    turnover: r.get(4)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (code, name, kind, snapshot) = row?;
+            match SectorKind::parse(&kind) {
+                Some(kind) => out.push((code, name, kind, snapshot)),
+                // 类型是我们自己写进去的，认不出说明库被别的东西改过，跳过这一个
+                None => eprintln!("[souba] 跳过类型无法识别的板块 {code}：{kind:?}"),
+            }
         }
         Ok(out)
     }

@@ -31,13 +31,61 @@ pub struct Ranked {
     pub heat: Heat,
 }
 
-/// `souba scan`：行业与概念一起拉、一起落库、一起排榜。
+/// 扫描进度。
+///
+/// `Log` 是 `souba scan` 打到 stdout 的那份详细文本 —— 面板不看它，它也不该
+/// 决定 UI 显示什么。其余变体就是面板顶部要的「阶段 + x/y + 错误」。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    Log(String),
+    /// 正在拉板块列表
+    Sectors,
+    /// 正在取第 done 个板块的候选（1 起）
+    Members { done: usize, total: usize },
+    Backfill { done: usize, total: usize },
+    Evaluating,
+    Done,
+    Failed(String),
+}
+
+/// `souba scan`：详细文本原样打到 stdout，阶段信息（面板用的那份）忽略。
+pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
+    run(store, |p| {
+        if let Progress::Log(s) = p {
+            print!("{s}");
+            // 逐只回补时「回补 3/160　CN:600519 贵州茅台　」先出来、结果后出来，
+            // 不刷新的话这一截会卡在缓冲里，看着像卡死了
+            let _ = std::io::stdout().flush();
+        }
+    })
+    .await
+}
+
+/// 扫描一次。TUI 与 CLI 共用这一条 —— 区别只在 `progress` 这个出口。
+///
+/// 失败时 `Failed` 也会推给 `progress`（面板要显示原因），调用方同时拿到 `Err`。
+pub async fn run(store: &Store, progress: impl Fn(Progress)) -> anyhow::Result<()> {
+    match scan(store, &progress).await {
+        Ok(()) => {
+            progress(Progress::Done);
+            Ok(())
+        }
+        Err(e) => {
+            progress(Progress::Failed(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+/// 行业与概念一起拉、一起落库、一起排榜。
 ///
 /// 板块列表拉不到就整体失败 —— 榜单缺了一半不如不给。
-pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
+async fn scan(store: &Store, progress: &impl Fn(Progress)) -> anyhow::Result<()> {
+    let log = |s: String| progress(Progress::Log(s));
     let cfg = crate::settings::Settings::load(store)?;
     let p = cfg.scan.clone();
     let date = today();
+    progress(Progress::Sectors);
     let src = SectorSource::new()?;
     let mut all = fetch(&src, SectorKind::Industry).await?;
     all.extend(fetch(&src, SectorKind::Concept).await?);
@@ -45,64 +93,78 @@ pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
     store.record_sectors(Market::Cn, &date, &all)?;
     let total = all.len();
     let ranked = rank(store, &date, all, &p)?;
-    print!("{}", render(&date, total, &ranked, &p));
+    log(render(&date, total, &ranked, &p));
 
     // 每个热门板块取涨幅前 K 只做候选。一个板块拉不到不该让整次扫描白跑 ——
     // 板块列表已经落库了，其余板块的候选照常取。
     let mut by_sector = Vec::with_capacity(ranked.len());
-    for r in &ranked {
+    for (i, r) in ranked.iter().enumerate() {
+        progress(Progress::Members {
+            done: i + 1,
+            total: ranked.len(),
+        });
         match src.members(&r.sector.code, p.k).await {
             Ok(got) => {
                 store.record_members(Market::Cn, &r.sector.code, &date, &got.list)?;
-                print!("{}", render_members(&r.sector.name, &got));
+                log(render_members(&r.sector.name, &got));
                 by_sector.push(got.list);
             }
-            Err(e) => println!("\n{}　候选拉取失败：{e}", r.sector.name),
+            Err(e) => log(format!("\n{}　候选拉取失败：{e}\n", r.sector.name)),
         }
     }
 
     let q = queue(store, &by_sector)?;
-    backfill_all(store, q).await?;
+    backfill_all(store, q, progress).await?;
 
     // 回补完才求值 —— 反过来的话首日每只都是「回补中」，白跑一趟
+    progress(Progress::Evaluating);
     let list: Vec<(String, String)> = ranked
         .iter()
         .map(|r| (r.sector.code.clone(), r.sector.name.clone()))
         .collect();
     let report = evaluate::run(store, Market::Cn, &date, &list, &cfg)?;
-    print!("{}", evaluate::render(&report, &p));
+    log(evaluate::render(&report, &p));
     Ok(())
 }
 
-/// 逐只回补并打印进度。单只失败只记下来继续 —— 一只退市股拉不到历史，
+/// 逐只回补并报进度。单只失败只记下来继续 —— 一只退市股拉不到历史，
 /// 不该把后面一百多只一起废掉。
-async fn backfill_all(store: &Store, q: Queue) -> anyhow::Result<()> {
+async fn backfill_all(
+    store: &Store,
+    q: Queue,
+    progress: &impl Fn(Progress),
+) -> anyhow::Result<()> {
+    let log = |s: String| progress(Progress::Log(s));
     let client = HistoryClient::new()?;
     let total = q.pending.len();
-    println!("\n候选 {} 只（去重后），其中 {} 只已有历史，需回补 {total} 只", q.ready + total, q.ready);
+    log(format!(
+        "\n候选 {} 只（去重后），其中 {} 只已有历史，需回补 {total} 只\n",
+        q.ready + total,
+        q.ready
+    ));
     let mut done = 0usize;
     let mut failed = Vec::new();
     for (i, m) in q.pending.iter().enumerate() {
-        print!("回补 {}/{total}　{} {}　", i + 1, m.symbol, m.name);
-        let _ = std::io::stdout().flush();
+        progress(Progress::Backfill { done: i + 1, total });
+        log(format!("回补 {}/{total}　{} {}　", i + 1, m.symbol, m.name));
         match backfill::run(store, &client, &m.symbol).await {
             Ok(n) => {
                 done += 1;
-                println!("{n} 根");
+                log(format!("{n} 根\n"));
             }
             Err(e) => {
-                println!("失败：{e}");
+                log(format!("失败：{e}\n"));
                 failed.push((m.clone(), e.to_string()));
             }
         }
     }
-    println!(
-        "\n回补汇总：已有历史 {} 只，本次补齐 {done} 只，失败 {} 只",
+    log(format!(
+        "\n回补汇总：已有历史 {} 只，本次补齐 {done} 只，失败 {} 只\n",
         q.ready,
         failed.len()
-    );
+    ));
     for (m, e) in &failed {
-        println!("  {} {}　{e}", m.symbol, m.name);
+        log(format!("  {} {}　{e}\n", m.symbol, m.name));
     }
     Ok(())
 }
@@ -142,7 +204,7 @@ async fn fetch(src: &SectorSource, kind: SectorKind) -> anyhow::Result<Vec<Secto
         .map_err(|e| anyhow::anyhow!("{}板块列表拉取失败：{e}", kind.label()))
 }
 
-fn today() -> String {
+pub fn today() -> String {
     chrono::Utc::now()
         .with_timezone(&Market::Cn.timezone())
         .date_naive()

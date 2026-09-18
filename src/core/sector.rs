@@ -28,6 +28,15 @@ impl SectorKind {
         }
     }
 
+    /// `as_str` 的逆向。认不出就是 None —— 不替库里的坏值猜一个类型出来。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "industry" => Some(SectorKind::Industry),
+            "concept" => Some(SectorKind::Concept),
+            _ => None,
+        }
+    }
+
     /// 界面上显示的值
     pub fn label(self) -> &'static str {
         match self {

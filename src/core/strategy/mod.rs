@@ -37,6 +37,18 @@ impl Stance {
         }
     }
 
+    /// `as_str` 的逆向。库里的 `stance` 还有一个 `backfilling`，它不是 `Stance`
+    /// 的取值（见 `scan::evaluate::BACKFILLING`），所以这里认不出来就是 None。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "long" => Some(Stance::Long),
+            "watch" => Some(Stance::Watch),
+            "exit" => Some(Stance::Exit),
+            "insufficient" => Some(Stance::Insufficient),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Stance::Long => "做多",
