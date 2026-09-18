@@ -4,6 +4,8 @@
 //! 三个可展示的分量。分量要单独给出来 —— 用户要能自己判断公式选得对不对，
 //! 只给一个总分他没法判断。
 
+use crate::core::symbol::Symbol;
+
 /// 板块的一日快照。change_pct 是百分数（-0.96 表示跌 0.96%），turnover 是元。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Snapshot {
@@ -41,6 +43,16 @@ pub struct Sector {
     pub name: String,
     pub kind: SectorKind,
     pub snapshot: Snapshot,
+}
+
+/// 板块内的一只成分股。名次不进结构体 —— 它是「在这一次抓取的这个板块里排第几」，
+/// 属于落库时的上下文，不属于标的本身。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Member {
+    pub symbol: Symbol,
+    pub name: String,
+    /// 当日涨幅，百分数
+    pub change_pct: f64,
 }
 
 /// 热度与它的三个分量。
