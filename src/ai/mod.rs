@@ -114,46 +114,15 @@ impl Endpoint {
         })
     }
 
-    /// 进程环境优先，其次当前目录的 `.env`。
+    /// 三级查找（进程环境 → 当前目录 `.env` → 用户数据目录 `.env`），见 `crate::dotenv`。
     pub fn from_env(model_override: &str) -> Result<Self, AiError> {
-        let mut vars = parse_env(&std::fs::read_to_string(".env").unwrap_or_default());
-        for k in ["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"] {
-            if let Ok(v) = std::env::var(k)
-                && !v.trim().is_empty()
-            {
-                vars.insert(k.to_string(), v);
-            }
-        }
+        let vars = crate::dotenv::load(&["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"]);
         Self::resolve(&vars, model_override)
     }
 
     pub fn url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
-}
-
-/// 最小 `.env` 解析：`KEY=VALUE` 逐行，跳过空行与 `#` 注释，去掉成对的引号。
-/// 不引 dotenv —— 这个文件只有我自己写，不需要支持多行值与变量展开。
-pub fn parse_env(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        let v = v.trim();
-        let v = v
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-            .unwrap_or(v);
-        out.insert(k.trim().to_string(), v.to_string());
-    }
-    out
 }
 
 fn state_word(s: FacetState) -> &'static str {
@@ -565,30 +534,6 @@ mod tests {
             Endpoint::resolve(&v, "").unwrap_err(),
             AiError::MissingKey
         ));
-    }
-
-    #[test]
-    fn env解析跳过注释与空行并去引号() {
-        let m = parse_env(
-            "# 注释\n\n\
-             LLM_API_KEY=sk-123\n\
-             export LLM_MODEL=\"qwen3.7-flash\"\n\
-             LLM_BASE_URL = 'https://x.test/v1' \n\
-             没有等号的一行\n\
-             EMPTY=\n",
-        );
-        assert_eq!(m.get("LLM_API_KEY").unwrap(), "sk-123");
-        assert_eq!(m.get("LLM_MODEL").unwrap(), "qwen3.7-flash");
-        assert_eq!(m.get("LLM_BASE_URL").unwrap(), "https://x.test/v1");
-        assert_eq!(m.get("EMPTY").unwrap(), "");
-        assert!(!m.contains_key("# 注释"));
-        assert_eq!(m.len(), 4);
-    }
-
-    #[test]
-    fn 值里带等号不被截断() {
-        let m = parse_env("LLM_API_KEY=a=b=c\n");
-        assert_eq!(m.get("LLM_API_KEY").unwrap(), "a=b=c");
     }
 
     #[test]

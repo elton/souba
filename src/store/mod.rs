@@ -33,6 +33,40 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// 同步时一张表的一行：列名 → 值。与 Worker 的 JSON 行一一对应。
+pub type Row = serde_json::Map<String, serde_json::Value>;
+
+fn to_json(v: rusqlite::types::ValueRef) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(i) => i.into(),
+        // NaN / 无穷在 JSON 里没有表示，落成 null 让对端按缺值拒绝，
+        // 好过悄悄写一个 0 进去。schema 里这些列都是价格与涨幅，不该出现。
+        ValueRef::Real(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned().into(),
+        // schema 里没有 BLOB 列
+        ValueRef::Blob(_) => serde_json::Value::Null,
+    }
+}
+
+fn to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Integer(i),
+            None => Value::Real(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        serde_json::Value::Bool(b) => Value::Integer(*b as i64),
+        // 数组 / 对象在这套 schema 里不存在；落成文本总比 panic 好
+        other => Value::Text(other.to_string()),
+    }
+}
+
 /// 与 Cloudflare D1 共用的迁移。一个元素一个版本，按序执行，
 /// 执行到第 n 个就把 `PRAGMA user_version` 记成 n —— D1 没有 user_version，
 /// 它用 `wrangler d1 migrations` 自己记账，所以 SQL 文件里不写 PRAGMA。
@@ -107,9 +141,10 @@ impl Store {
             |r| r.get(0),
         )?;
         conn.execute(
-            "INSERT INTO watchlist (symbol, name, sort_order, added_at)
-             VALUES (?1, ?2, ?3, unixepoch())
-             ON CONFLICT(symbol) DO UPDATE SET name = excluded.name",
+            "INSERT INTO watchlist (symbol, name, sort_order, added_at, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch(), unixepoch())
+             ON CONFLICT(symbol) DO UPDATE SET
+               name = excluded.name, updated_at = excluded.updated_at",
             rusqlite::params![symbol.to_string(), name, next],
         )?;
         Ok(())
@@ -538,6 +573,109 @@ impl Store {
             "INSERT INTO ai_cache (key, response, created_at) VALUES (?1, ?2, unixepoch())
              ON CONFLICT(key) DO UPDATE SET response = excluded.response, created_at = excluded.created_at",
             rusqlite::params![key, response],
+        )?;
+        Ok(())
+    }
+
+    // ── 同步（`crate::sync`）用的通用行读写 ─────────────────────────────
+    //
+    // 六张板块系表加 bars / watchlist / settings，逐张写一遍类型化的读写是八套
+    // 一模一样的样板。表名与列名全部来自 `sync` 模块里的常量（和 Worker 的
+    // SECTOR_TABLES 一一对应），不来自远端输入，所以拼进 SQL 是安全的。
+
+    /// 按游标读一张表。`strict` = 游标列是 unix 秒（用 `>`）；否则是业务日期（用 `>=`，
+    /// 同一天的行会重复取到，而 upsert 幂等，重传无害、漏传有害）。
+    /// `eq` 是附加的等值过滤（bars 按标的 + 周期推送用它）。
+    pub fn sync_rows(
+        &self,
+        table: &str,
+        cols: &[&str],
+        cursor: &str,
+        strict: bool,
+        since: &serde_json::Value,
+        eq: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<Row>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let list = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let op = if strict { ">" } else { ">=" };
+        let filter: String = eq
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| format!(" AND \"{c}\" = ?{}", i + 2))
+            .collect();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {list} FROM \"{table}\" WHERE \"{cursor}\" {op} ?1{filter}
+             ORDER BY \"{cursor}\""
+        ))?;
+        let mut bind: Vec<rusqlite::types::Value> = vec![to_sql(since)];
+        bind.extend(
+            eq.iter()
+                .map(|(_, v)| rusqlite::types::Value::Text((*v).to_string())),
+        );
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), |r| {
+            let mut row = Row::new();
+            for (i, c) in cols.iter().enumerate() {
+                row.insert((*c).to_string(), to_json(r.get_ref(i)?));
+            }
+            Ok(row)
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 整行按主键覆盖写入。缺列或类型不对的行整批拒绝 ——
+    /// 宁可这次同步失败，也不往库里写半行。
+    pub fn sync_replace(&self, table: &str, cols: &[&str], rows: &[Row]) -> anyhow::Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().expect("store 锁中毒");
+        let list = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let holes = (1..=cols.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare(&format!("INSERT OR REPLACE INTO \"{table}\" ({list}) VALUES ({holes})"))?;
+            for row in rows {
+                let mut vals = Vec::with_capacity(cols.len());
+                for c in cols {
+                    let v = row
+                        .get(*c)
+                        .ok_or_else(|| anyhow::anyhow!("{table} 的行缺少列 {c}"))?;
+                    vals.push(to_sql(v));
+                }
+                stmt.execute(rusqlite::params_from_iter(vals))?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    pub fn sync_state_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        Ok(conn
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn sync_state_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
         )?;
         Ok(())
     }

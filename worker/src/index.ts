@@ -312,12 +312,16 @@ async function getBars(url: URL, env: Env): Promise<Response> {
   if (!Number.isFinite(since)) return bad('since 不是数字')
   // 夹在 1..PAGE：SQLite 的负数 LIMIT 等于不限制，那就成了无界响应
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || PAGE, 1), PAGE)
+  // 可选的按标的过滤：另一台机器回补的新标的，历史 ts 早于本机游标，
+  // 光靠 since 永远拉不到它 —— 客户端此时带 symbol= 且 since=0 全量拉这一只。
+  const symbol = url.searchParams.get('symbol')
 
   const { results } = await env.DB.prepare(
     `SELECT symbol, timeframe, ts, open, high, low, close, volume
-     FROM bars WHERE ts > ?1 ORDER BY ts LIMIT ?2`,
+     FROM bars WHERE ts > ?1${symbol === null ? '' : ' AND symbol = ?3'}
+     ORDER BY ts LIMIT ?2`,
   )
-    .bind(since, limit)
+    .bind(...(symbol === null ? [since, limit] : [since, limit, symbol]))
     .all<{ ts: number }>()
 
   let rows = results

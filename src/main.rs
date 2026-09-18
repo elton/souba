@@ -1,10 +1,12 @@
 mod ai;
 mod core;
+mod dotenv;
 mod settings;
 mod scan;
 mod loader;
 mod source;
 mod store;
+mod sync;
 mod ui;
 
 use std::sync::Arc;
@@ -101,6 +103,18 @@ impl Scanner {
     }
 }
 
+/// 起一次后台同步。失败只变成顶栏那一行字，永远不冒泡到主循环。
+fn spawn_sync(
+    store: Arc<Store>,
+    tx: tokio::sync::mpsc::UnboundedSender<sync::Status>,
+    do_pull: bool,
+) {
+    let _ = tx.send(sync::Status::Running);
+    tokio::spawn(async move {
+        let _ = tx.send(sync::background(&store, do_pull).await);
+    });
+}
+
 /// 自选股 + 面板里的标的，去重后交给同一次批量报价 ——
 /// 腾讯一个请求就能混市场拿 100 只，按屏分开请求纯属白打。
 fn quote_symbols(watch: &[Symbol], panel: &Panel) -> Vec<Symbol> {
@@ -159,7 +173,8 @@ async fn main() -> anyhow::Result<()> {
              souba set <键> <值>  修改策略与扫描参数\n  \
              souba get <键>       查看某个参数的当前值与默认值\n  \
              souba settings       列出全部参数\n  \
-             souba scan           拉板块与候选、回补缺的历史并打印热度榜"
+             souba scan           拉板块与候选、回补缺的历史并打印热度榜\n  \
+             souba sync           与 Worker 同步一次并打印摘要"
         );
         return Ok(());
     }
@@ -169,6 +184,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if arg.as_deref() == Some("scan") {
         return scan::run_cli(&store).await;
+    }
+    if arg.as_deref() == Some("sync") {
+        return sync::run_cli(&store).await;
     }
     let direct = match arg {
         Some(a) => Some(parse_cli_symbol(&a)?),
@@ -232,6 +250,11 @@ async fn main() -> anyhow::Result<()> {
     let mouse_ok = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_ON).is_ok();
     let mut app = App::new();
     app.vegas = cfg.vegas;
+
+    // 同步也是后台的：先拉后推。拉不通只是顶栏多一行「未同步」，
+    // 看盘那条路不碰它 —— 行情本来就是 TUI 直连腾讯拿的（story 61）。
+    let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<sync::Status>();
+    spawn_sync(Arc::clone(&store), sync_tx.clone(), true);
 
     // 今天还没扫过就后台扫一次，主界面照常先出来（story 41）。
     // 已经有今天的结果就什么都不做 —— 重跑一次拿到的是同一份，白等十几分钟。
@@ -300,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
         &mut bar_rx,
         &ai_tx,
         &mut ai_res_rx,
+        &sync_tx,
+        &mut sync_rx,
         backend,
     )
     .await;
@@ -328,6 +353,8 @@ async fn run(
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
     ai_tx: &tokio::sync::mpsc::Sender<AiJob>,
     ai_res_rx: &mut tokio::sync::mpsc::Receiver<AiAnswer>,
+    sync_tx: &tokio::sync::mpsc::UnboundedSender<sync::Status>,
+    sync_rx: &mut tokio::sync::mpsc::UnboundedReceiver<sync::Status>,
     backend: Backend,
 ) -> anyhow::Result<()> {
     // 十字光标随鼠标动，所以鼠标位置也要纳入重绘判定 —— 否则位图不会刷新
@@ -348,6 +375,8 @@ async fn run(
         while let Ok(p) = scanner.rx.try_recv() {
             opportunities::apply(&mut app.scan_status, &p);
             if p == scan::Progress::Done {
+                // 新回补的历史、因子、板块快照、扫描结果一次推上去（story 58）
+                spawn_sync(Arc::clone(&scanner.store), sync_tx.clone(), false);
                 match scanner.panel() {
                     Ok(fresh) => {
                         *panel = fresh;
@@ -357,6 +386,9 @@ async fn run(
                     Err(e) => app.notice = Some(format!("扫描结果读取失败：{e}")),
                 }
             }
+        }
+        while let Ok(st) = sync_rx.try_recv() {
+            app.sync = st;
         }
         if app.scan_request {
             app.scan_request = false;
@@ -607,6 +639,13 @@ fn draw(
             " souba  相場",
             Style::default().add_modifier(Modifier::BOLD),
         )),
+        panes.header,
+    );
+    // 同步状态贴在顶栏右端。Worker 挂了 / 额度用完是常态，说清楚比装作没事重要。
+    frame.render_widget(
+        Paragraph::new(ui::sync_label(&app.sync))
+            .right_aligned()
+            .style(Style::default().fg(Color::DarkGray)),
         panes.header,
     );
 

@@ -154,6 +154,35 @@ describe('GET /sync/bars?since=', () => {
   it('缺少 since 返回 400', async () => {
     expect((await call(get('/sync/bars'))).status).toBe(400)
   })
+
+  // 另一台机器回补的新标的，历史 ts 早于本机游标，增量拉永远看不到它 ——
+  // 客户端发现「远端已 done、本地没补」时按标的全量拉，靠的就是这个参数。
+  it('symbol= 只返回该标的的 bar，且 since=0 时给出全量', async () => {
+    await call(post('/sync/bars', { bars: [{ ...BAR, symbol: 'CN:000001', ts: 50 }] }))
+    const one = await (await call(get('/sync/bars?since=0&symbol=CN:000001'))).json<{
+      bars: { symbol: string; ts: number }[]
+      next: number | null
+    }>()
+    expect(one.bars.map((b) => b.ts)).toEqual([50])
+    expect(one.bars.every((b) => b.symbol === 'CN:000001')).toBe(true)
+    expect(one.next).toBe(50)
+  })
+
+  it('symbol= 与 since= 叠加生效', async () => {
+    const body = await (await call(get('/sync/bars?since=100&symbol=CN:600519'))).json<{
+      bars: { ts: number }[]
+    }>()
+    expect(body.bars.map((b) => b.ts)).toEqual([200, 300])
+  })
+
+  it('symbol= 对不存在的标的返回空', async () => {
+    const body = await (await call(get('/sync/bars?since=0&symbol=CN:999999'))).json<{
+      bars: unknown[]
+      next: number | null
+    }>()
+    expect(body.bars).toEqual([])
+    expect(body.next).toBeNull()
+  })
 })
 
 describe('腾讯报价行解析', () => {

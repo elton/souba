@@ -14,9 +14,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::core::strategy::vegas::VegasParams;
 use crate::core::bar::Timeframe;
+use crate::sync;
 use crate::ui::detail::{AiPane, AiState, IndicatorKind};
 use crate::ui::opportunities::ScanStatus;
 use crate::ui::viewport::Viewport;
+
+/// 顶栏右侧那一截同步状态。
+///
+/// 「没在同步」必须说得出原因 —— 静默地不同步，跟把延迟数据当实时显示是同一类谎。
+pub fn sync_label(s: &sync::Status) -> String {
+    match s {
+        sync::Status::Idle => String::new(),
+        sync::Status::Running => "同步中… ".to_string(),
+        sync::Status::Ok(at) => format!("已同步 {at} "),
+        sync::Status::Failed(why) => format!("未同步：{why} "),
+    }
+}
 
 /// 界面当前停在哪一屏
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +86,8 @@ pub struct App {
     pub notice: Option<String>,
     /// 详情屏是从哪一屏进来的 —— `Esc` 要回到那里，而不是一律回自选股
     pub detail_from: Screen,
+    /// 与 Worker 的同步状态，主循环从同步任务的通道归约进来
+    pub sync: sync::Status,
 }
 
 impl App {
@@ -97,6 +112,7 @@ impl App {
             add_request: false,
             notice: None,
             detail_from: Screen::Watchlist,
+            sync: sync::Status::Idle,
         }
     }
 
@@ -885,6 +901,16 @@ mod panel_tests {
         app.on_key_with(press(KeyCode::Char('R')), rows());
         assert_eq!(app.ai_request, Some(true), "R 要绕过缓存");
         assert!(matches!(app.ai.as_ref().unwrap().state, AiState::Loading));
+    }
+
+    #[test]
+    fn 顶栏说得出没在同步的原因() {
+        assert_eq!(sync_label(&sync::Status::Idle), "");
+        assert_eq!(sync_label(&sync::Status::Ok("14:32".into())).trim(), "已同步 14:32");
+        assert_eq!(
+            sync_label(&sync::Status::Failed("密钥不匹配（401）".into())).trim(),
+            "未同步：密钥不匹配（401）"
+        );
     }
 
     #[test]
