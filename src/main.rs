@@ -1,4 +1,5 @@
 mod core;
+mod loader;
 mod source;
 mod store;
 mod ui;
@@ -16,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use crate::core::bar::Timeframe;
 use crate::core::quote::Quote;
 use crate::core::symbol::Symbol;
+use crate::loader::BarKey;
 use crate::source::QuoteSource;
-use crate::source::history::{HistoryClient, HistoryError};
 use crate::source::tencent::TencentSource;
 use crate::store::Store;
 use crate::ui::detail::{BarState, DetailView};
@@ -31,9 +32,6 @@ const REFRESH: Duration = Duration::from_secs(3);
 /// 一次拉多少根历史。EMA576 要 1330 根才收敛，日线给足；
 /// 分钟线源本身也给不了这么多，多要无害。
 const HISTORY_BARS: usize = 1500;
-
-/// 历史加载请求：标的 + 周期
-type BarKey = (Symbol, Timeframe);
 
 /// 把命令行给的代码解析成 Symbol。
 ///
@@ -55,7 +53,7 @@ fn parse_cli_symbol(raw: &str) -> anyhow::Result<Symbol> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store = Store::open(&Store::default_path()?)?;
+    let store = Arc::new(Store::open(&Store::default_path()?)?);
     seed_if_empty(&store)?;
 
     let arg = std::env::args().nth(1);
@@ -105,31 +103,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 历史：按需加载，请求走 channel，结果走 watch
-    let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<BarKey>(8);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<BarKey>(8);
     let (bar_tx, mut bar_rx) =
         tokio::sync::watch::channel::<(Option<BarKey>, BarState)>((None, BarState::Loading));
-    tokio::spawn(async move {
-        let client = match HistoryClient::new() {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                let _ = bar_tx.send((None, BarState::Failed(e.to_string())));
-                return;
-            }
-        };
-        while let Some(key) = req_rx.recv().await {
-            let _ = bar_tx.send((Some(key.clone()), BarState::Loading));
-            let state = match client.bars(&key.0, key.1, HISTORY_BARS).await {
-                Ok(bars) => BarState::Ready(bars),
-                // 「没有数据源」和「拉取失败」要分开 —— 前者重试多少次都没用
-                Err(e @ (HistoryError::MarketUnsupported(_)
-                | HistoryError::TimeframeUnsupported { .. })) => {
-                    BarState::Unsupported(e.to_string())
-                }
-                Err(e) => BarState::Failed(e.to_string()),
-            };
-            let _ = bar_tx.send((Some(key), state));
-        }
-    });
+    loader::spawn(store.clone(), req_rx, bar_tx, HISTORY_BARS);
 
     let backend = Backend::detect();
     let mut terminal = ratatui::init();

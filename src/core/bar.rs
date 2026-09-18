@@ -34,10 +34,8 @@ impl Timeframe {
         }
     }
 
-    /// 存库用的稳定标识，与 D1 共用。阶段 4 落库时才有调用方，
-    /// 现在留着是因为「本地 SQLite 与 D1 共用同一套 schema」是设计的硬要求，
+    /// 存库用的稳定标识，与 D1 共用 —— 本地 SQLite 与 D1 是同一套 schema，
     /// 周期标识必须在两边保持一致。
-    #[allow(dead_code)]
     pub fn key(self) -> &'static str {
         match self {
             Timeframe::Day => "1d",

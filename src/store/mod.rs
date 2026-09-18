@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
+use crate::core::adjust::{AdjFactor, apply_factors};
+use crate::core::bar::{Bar, Timeframe};
 use crate::core::symbol::Symbol;
 
 #[derive(Debug, Clone)]
@@ -100,6 +102,150 @@ impl Store {
         Ok(())
     }
 
+    /// 批量写入**原始价** bar。幂等：主键冲突时覆盖，重复导入不会产生重复行。
+    /// 覆盖而不是忽略，是因为源偶尔会修正当日的最后一根。
+    pub fn upsert_bars(&self, symbol: &Symbol, tf: Timeframe, bars: &[Bar]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().expect("store 锁中毒");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO bars (symbol, timeframe, ts, open, high, low, close, volume)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(symbol, timeframe, ts) DO UPDATE SET
+                   open = excluded.open, high = excluded.high, low = excluded.low,
+                   close = excluded.close, volume = excluded.volume",
+            )?;
+            let sym = symbol.to_string();
+            for b in bars {
+                stmt.execute(rusqlite::params![
+                    sym,
+                    tf.key(),
+                    b.ts.timestamp(),
+                    b.open,
+                    b.high,
+                    b.low,
+                    b.close,
+                    b.volume
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 库里存的原始价，不做任何复权。测试与同步用它；画图请用 `adjusted_bars`。
+    pub fn raw_bars(&self, symbol: &Symbol, tf: Timeframe) -> anyhow::Result<Vec<Bar>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT ts, open, high, low, close, volume FROM bars
+             WHERE symbol = ?1 AND timeframe = ?2 ORDER BY ts",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![symbol.to_string(), tf.key()], |r| {
+            Ok(Bar {
+                ts: chrono::DateTime::from_timestamp(r.get::<_, i64>(0)?, 0)
+                    .unwrap_or_default(),
+                open: r.get(1)?,
+                high: r.get(2)?,
+                low: r.get(3)?,
+                close: r.get(4)?,
+                volume: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 读时复权：原始价按因子表折算。因子变了结果就变，`bars` 一行不动。
+    pub fn adjusted_bars(&self, symbol: &Symbol, tf: Timeframe) -> anyhow::Result<Vec<Bar>> {
+        let mut bars = self.raw_bars(symbol, tf)?;
+        let factors = self.adj_factors(symbol)?;
+        apply_factors(&mut bars, &factors, symbol.market.timezone());
+        Ok(bars)
+    }
+
+    /// 幂等：同一除权日重复写入只更新因子值
+    pub fn upsert_adj_factors(
+        &self,
+        symbol: &Symbol,
+        factors: &[AdjFactor],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().expect("store 锁中毒");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO adj_factors (symbol, effective_date, factor) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(symbol, effective_date) DO UPDATE SET factor = excluded.factor",
+            )?;
+            let sym = symbol.to_string();
+            for a in factors {
+                stmt.execute(rusqlite::params![
+                    sym,
+                    a.effective_date.to_string(),
+                    a.factor
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 按除权日升序 —— `apply_factors` 要靠这个顺序做二分
+    pub fn adj_factors(&self, symbol: &Symbol) -> anyhow::Result<Vec<AdjFactor>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT effective_date, factor FROM adj_factors WHERE symbol = ?1
+             ORDER BY effective_date",
+        )?;
+        let rows = stmt.query_map([symbol.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (d, factor) = row?;
+            match d.parse() {
+                Ok(effective_date) => out.push(AdjFactor {
+                    effective_date,
+                    factor,
+                }),
+                // 坏掉的一条因子不该让整只标的画不出图
+                Err(e) => eprintln!("[souba] 跳过无法解析的除权日 {d:?}：{e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn backfill_status(
+        &self,
+        symbol: &Symbol,
+        tf: Timeframe,
+    ) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let v = conn
+            .query_row(
+                "SELECT status FROM backfill_state WHERE symbol = ?1 AND timeframe = ?2",
+                rusqlite::params![symbol.to_string(), tf.key()],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(v)
+    }
+
+    pub fn set_backfill_status(
+        &self,
+        symbol: &Symbol,
+        tf: Timeframe,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        conn.execute(
+            "INSERT INTO backfill_state (symbol, timeframe, status, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(symbol, timeframe) DO UPDATE SET
+               status = excluded.status, updated_at = excluded.updated_at",
+            rusqlite::params![symbol.to_string(), tf.key(), status],
+        )?;
+        Ok(())
+    }
+
     /// 阶段 2 的 d 键会调用它。现在自选股靠 seed 预置，还没有删除入口。
     #[allow(dead_code)]
     pub fn remove(&self, symbol: &Symbol) -> anyhow::Result<()> {
@@ -184,6 +330,172 @@ mod tests {
         st.add(&sym("HK:700"), "腾讯控股").unwrap();
         // 港股补足五位后存储
         assert_eq!(st.watchlist().unwrap()[0].symbol.to_string(), "HK:00700");
+    }
+
+    // 真实响应：茅台全量日线的抽样（首尾各 20 根 + 几个对照日前后各 5 根）与全量 qfq 因子
+    const CN_DAY: &[u8] = include_bytes!("../../tests/fixtures/sina_cn_kline_day_sh600519.json");
+    const QFQ: &[u8] = include_bytes!("../../tests/fixtures/sina_cn_qfq_sh600519.js");
+
+    fn maotai() -> Symbol {
+        sym("CN:600519")
+    }
+
+    /// 把 fixture 里的原始日线与因子灌进一个空库
+    fn seeded() -> Store {
+        let st = Store::open_in_memory().unwrap();
+        let bars =
+            crate::source::history::parse_sina_cn(CN_DAY, chrono_tz::Asia::Shanghai).unwrap();
+        st.upsert_bars(&maotai(), Timeframe::Day, &bars).unwrap();
+        let factors = crate::source::history::parse_sina_qfq(QFQ).unwrap();
+        st.upsert_adj_factors(&maotai(), &factors).unwrap();
+        st
+    }
+
+    /// 取某个交易日那根 bar 的收盘价
+    fn close_on(bars: &[Bar], day: &str) -> f64 {
+        let d: chrono::NaiveDate = day.parse().unwrap();
+        bars.iter()
+            .find(|b| {
+                b.ts.with_timezone(&chrono_tz::Asia::Shanghai).date_naive() == d
+            })
+            .unwrap_or_else(|| panic!("fixture 里没有 {day} 这一根"))
+            .close
+    }
+
+    #[test]
+    fn bars批量写入幂等() {
+        let st = seeded();
+        let n = st.raw_bars(&maotai(), Timeframe::Day).unwrap().len();
+        assert!(n > 50, "fixture 应该有几十根，实际 {n}");
+        let bars =
+            crate::source::history::parse_sina_cn(CN_DAY, chrono_tz::Asia::Shanghai).unwrap();
+        st.upsert_bars(&maotai(), Timeframe::Day, &bars).unwrap();
+        assert_eq!(
+            st.raw_bars(&maotai(), Timeframe::Day).unwrap().len(),
+            n,
+            "重复导入不该产生重复行"
+        );
+    }
+
+    #[test]
+    fn bars按周期分开存互不覆盖() {
+        let st = seeded();
+        let day_n = st.raw_bars(&maotai(), Timeframe::Day).unwrap().len();
+        let one = st.raw_bars(&maotai(), Timeframe::Day).unwrap()[..1].to_vec();
+        st.upsert_bars(&maotai(), Timeframe::Min60, &one).unwrap();
+        assert_eq!(st.raw_bars(&maotai(), Timeframe::Day).unwrap().len(), day_n);
+        assert_eq!(st.raw_bars(&maotai(), Timeframe::Min60).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 读时复权对得上腾讯的前复权价() {
+        // 新浪给原始价、腾讯给前复权价，两家算法不同（腾讯减分红、新浪除因子），
+        // 所以只能要求接近。实测偏差见 core::adjust 的注释表。
+        let st = seeded();
+        let adj = st.adjusted_bars(&maotai(), Timeframe::Day).unwrap();
+        for (day, tencent, tol) in [
+            // 2024-06-14 那天离今天最远，两家算法的差也最大：实测 0.534%
+            ("2024-06-14", 1420.661, 0.6),
+            ("2024-06-21", 1367.537, 0.3),
+            ("2025-06-20", 1349.079, 0.3),
+            ("2025-06-27", 1351.109, 0.3),
+        ] {
+            let got = close_on(&adj, day);
+            let dev = (got - tencent) / tencent * 100.0;
+            assert!(
+                dev.abs() < tol,
+                "{day}：复权后 {got:.3}，腾讯 {tencent}，偏差 {dev:.3}% 超过 {tol}%"
+            );
+        }
+    }
+
+    #[test]
+    fn 复权确实动了价格而不是原样返回() {
+        let st = seeded();
+        let raw = close_on(&st.raw_bars(&maotai(), Timeframe::Day).unwrap(), "2024-06-14");
+        assert!((raw - 1555.0).abs() < 1e-6, "库里必须是原始价，实际 {raw}");
+        let adj = close_on(&st.adjusted_bars(&maotai(), Timeframe::Day).unwrap(), "2024-06-14");
+        assert!(adj < raw - 100.0, "复权后应明显低于原始价：{adj} vs {raw}");
+    }
+
+    #[test]
+    fn 新增一条因子后重读结果变化而bars不变() {
+        let st = seeded();
+        let before_raw = st.raw_bars(&maotai(), Timeframe::Day).unwrap();
+        let before = close_on(&st.adjusted_bars(&maotai(), Timeframe::Day).unwrap(), "2026-09-17");
+
+        // 模拟又一次除权：2026-09-01 起累计因子变成 2
+        st.upsert_adj_factors(
+            &maotai(),
+            &[crate::core::adjust::AdjFactor {
+                effective_date: "2026-09-01".parse().unwrap(),
+                factor: 2.0,
+            }],
+        )
+        .unwrap();
+
+        let after = close_on(&st.adjusted_bars(&maotai(), Timeframe::Day).unwrap(), "2026-09-17");
+        assert!(
+            (after - before / 2.0).abs() < 1e-9,
+            "因子变了复权价就该跟着变：{before} → {after}"
+        );
+        assert!(
+            before_raw == st.raw_bars(&maotai(), Timeframe::Day).unwrap(),
+            "bars 行本身一个字节都不该动"
+        );
+        // 生效日之前的 bar 不受影响
+        let old = close_on(&st.adjusted_bars(&maotai(), Timeframe::Day).unwrap(), "2024-06-14");
+        assert!((old - 1413.081).abs() < 0.01, "早于生效日的 bar 不该受影响：{old}");
+    }
+
+    #[test]
+    fn 因子upsert幂等且按日期升序读回() {
+        let st = seeded();
+        let n = st.adj_factors(&maotai()).unwrap().len();
+        let again = crate::source::history::parse_sina_qfq(QFQ).unwrap();
+        st.upsert_adj_factors(&maotai(), &again).unwrap();
+        let got = st.adj_factors(&maotai()).unwrap();
+        assert_eq!(got.len(), n, "同一除权日重复写入不该多出行");
+        for w in got.windows(2) {
+            assert!(w[0].effective_date < w[1].effective_date);
+        }
+    }
+
+    #[test]
+    fn 没有因子时复权价等于原始价() {
+        let st = Store::open_in_memory().unwrap();
+        let bars =
+            crate::source::history::parse_sina_cn(CN_DAY, chrono_tz::Asia::Shanghai).unwrap();
+        st.upsert_bars(&maotai(), Timeframe::Day, &bars).unwrap();
+        assert_eq!(
+            st.raw_bars(&maotai(), Timeframe::Day).unwrap(),
+            st.adjusted_bars(&maotai(), Timeframe::Day).unwrap()
+        );
+    }
+
+    #[test]
+    fn 空库读出空序列而不是报错() {
+        let st = Store::open_in_memory().unwrap();
+        assert!(st.raw_bars(&maotai(), Timeframe::Day).unwrap().is_empty());
+        assert!(st.adjusted_bars(&maotai(), Timeframe::Day).unwrap().is_empty());
+        assert!(st.backfill_status(&maotai(), Timeframe::Day).unwrap().is_none());
+    }
+
+    #[test]
+    fn 回补状态可写可读可覆盖() {
+        let st = Store::open_in_memory().unwrap();
+        st.set_backfill_status(&maotai(), Timeframe::Day, "running").unwrap();
+        assert_eq!(
+            st.backfill_status(&maotai(), Timeframe::Day).unwrap().as_deref(),
+            Some("running")
+        );
+        st.set_backfill_status(&maotai(), Timeframe::Day, "done").unwrap();
+        assert_eq!(
+            st.backfill_status(&maotai(), Timeframe::Day).unwrap().as_deref(),
+            Some("done")
+        );
+        // 周期是主键的一部分，别互相踩
+        assert!(st.backfill_status(&maotai(), Timeframe::Min60).unwrap().is_none());
     }
 
     /// 阶段 1 的 schema，冻结在测试里当 fixture —— 它描述的是「线上旧库长什么样」，
