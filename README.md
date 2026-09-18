@@ -65,6 +65,33 @@ EMA576 / EMA676       慢隧道（= 快隧道 × 4）← 决定持仓与离场
 4. **A股 深度历史已解决** —— 新浪 `CN_MarketDataService` 能取 **1800 根日线（7.4 年）**，把 `EMA576` 的种子误差压到 0.2%。但港股/美股/日股仍需自行落库积累。
 5. **所有免费源都会封 IP** —— 数据层必须内建节流、缓存和退避。
 
+## Worker（同步与 Cron）
+
+`worker/` 是存储与代理层，不做任何指标计算 —— 免费版每次调用只有 10 ms CPU。
+D1 库 `souba`，绑定名 `DB`；所有接口都要请求头 `X-Souba-Key`，值在 `.env` 的
+`SOUBA_SYNC_KEY`，Worker 侧是同名 secret。
+
+```sh
+cd worker && pnpm install
+pnpm test                                   # vitest-pool-workers，跑本地 D1
+
+# 下面每一条都必须先 source 本项目的 .env —— 环境里的 CLOUDFLARE_API_TOKEN 属于另一个账户
+set -a && . ../.env && set +a
+pnpm exec wrangler whoami                   # 账户必须是 10100291fe85c71daed5efb6a3ff7795
+pnpm exec wrangler d1 migrations apply souba --remote
+pnpm exec wrangler secret put SOUBA_SYNC_KEY
+pnpm exec wrangler deploy
+```
+
+| 接口 | 作用 |
+|---|---|
+| `POST /sync/bars` | 批量 upsert，单次上限 2000 根，超了返回 413 |
+| `GET /sync/bars?since=<ts>` | 拉 `ts` 严格大于 `since` 的 bar，单页 5000，用返回的 `next` 续拉 |
+| `/probe` | 阶段 0 的出口可达性探测，改 `PROBE_TARGETS` 即可换目标 |
+
+Cron `0 * * * *`：按各市场时钟挑出「已收盘且今日未追加」的市场，用腾讯批量报价
+（100 只一批）给库里每只标的补上当天那根原始日线。目前只实现 A 股分支。
+
 ## 免责声明
 
 本项目仅用于技术学习与个人研究，**不构成任何投资建议**。行情数据来自第三方免费接口，延迟与准确性均无保证，不得用于实盘交易决策。

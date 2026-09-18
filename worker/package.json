@@ -5,11 +5,14 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "vitest run",
     "probe": "wrangler deploy && echo '部署完成，用 curl 打 /probe'"
   },
   "devDependencies": {
     "wrangler": "^4.126.0",
     "@cloudflare/workers-types": "^5.20260826.1",
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "vitest": "^4.1.11",
     "typescript": "^7.0.2"
   }
 }

@@ -3,5 +3,16 @@
   "name": "souba-worker",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-26",
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "souba",
+      "database_id": "94b4f36b-d8c1-4268-a5fa-437b8f859f4b",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // 每小时一次；处理器自己按各市场时钟挑「刚收盘且今日未追加」的市场。
+  // 账户级 Cron 配额只剩 4 个，四市场共用这一个。
+  "triggers": { "crons": ["0 * * * *"] }
 }
