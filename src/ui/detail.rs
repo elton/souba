@@ -493,7 +493,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// AI 解读文本区。**失败一律显示「AI 不可用：原因」** —— 跟行情源挂了一个待遇，
 /// 不静默、不装作没问过。
-fn render_ai(frame: &mut Frame, area: Rect, pane: &AiPane) {
+pub fn render_ai(frame: &mut Frame, area: Rect, pane: &AiPane) {
     if area.width == 0 || area.height == 0 {
         pane.max_scroll.set(0);
         return;

@@ -155,6 +155,12 @@ impl App {
     /// 机会面板。`Tab` 在板块列表与标的列表间切焦点 —— 面板里没有周期概念，
     /// 这个键空着。
     fn on_key_panel(&mut self, key: KeyEvent, rows: Rows) {
+        // 文本区开着就归它 —— 面板这一层的 Esc 是「回自选股」，
+        // 关一个浮层不该顺手退两层
+        if self.ai.is_some() {
+            self.on_key_ai(key);
+            return;
+        }
         // 任何一次按键都把上一条提示收掉，免得「已在自选」一直挂在底栏
         self.notice = None;
         match key.code {
@@ -184,6 +190,11 @@ impl App {
             }
             KeyCode::Char('a') if rows.picks > 0 => self.add_request = true,
             KeyCode::Char('r') => self.scan_request = true,
+            // ? 把当天全部板块 top 交给 AI 排序。跟详情屏一个键位。
+            KeyCode::Char('?') => {
+                self.ai = Some(AiPane::loading());
+                self.ai_request = Some(false);
+            }
             _ => {}
         }
     }
@@ -197,13 +208,13 @@ impl App {
     }
 
     /// 文本区开着时它吃掉所有按键。让 Tab 在这时候还能切周期只会让人搞不清
-    /// 屏幕上那段解读到底在说哪一份数据。
+    /// 屏幕上那段解读到底在说哪一份数据。详情屏与机会面板共用这一套键位。
     fn on_key_ai(&mut self, key: KeyEvent) {
         const PAGE: usize = 10;
         let Some(pane) = &mut self.ai else { return };
         let max = pane.max_scroll.get();
         match key.code {
-            // Esc 回到详情屏而不是列表 —— 关一个浮层不该顺手退两层
+            // Esc 只关文本区，回到它盖住的那一屏 —— 关一个浮层不该顺手退两层
             KeyCode::Esc | KeyCode::Char('q') => self.ai = None,
             KeyCode::Up | KeyCode::Char('k') => pane.scroll = pane.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => pane.scroll = (pane.scroll + 1).min(max),
@@ -814,6 +825,66 @@ mod panel_tests {
         app.notice = Some("已在自选".into());
         app.on_key_with(press(KeyCode::Down), rows());
         assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn 面板里问号打开文本区并发起一次整组解读() {
+        let mut app = panel();
+        app.on_key_with(press(KeyCode::Char('?')), rows());
+        assert!(app.ai.is_some(), "? 应打开 AI 文本区");
+        assert_eq!(app.ai_request, Some(false), "首次按不该绕过缓存");
+        assert_eq!(app.screen, Screen::Opportunities);
+    }
+
+    #[test]
+    fn 面板的文本区按esc回面板而不是回列表() {
+        let mut app = panel();
+        app.on_key_with(press(KeyCode::Char('?')), rows());
+        app.on_key_with(press(KeyCode::Esc), rows());
+        assert!(app.ai.is_none(), "Esc 应关掉文本区");
+        assert_eq!(app.screen, Screen::Opportunities, "关浮层不该顺手退两层");
+        // 再按一次才回自选股
+        app.on_key_with(press(KeyCode::Esc), rows());
+        assert_eq!(app.screen, Screen::Watchlist);
+    }
+
+    #[test]
+    fn 面板的文本区开着时其余按键不穿透() {
+        let mut app = panel();
+        app.on_key_with(press(KeyCode::Char('?')), rows());
+        app.ai.as_ref().unwrap().max_scroll.set(3);
+        for k in [
+            KeyCode::Tab,
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char('r'),
+        ] {
+            app.on_key_with(press(k), rows());
+        }
+        assert!(!app.focus_picks, "Tab 不该在解读开着时切焦点");
+        assert_eq!(app.screen, Screen::Opportunities, "Enter 不该穿透去详情屏");
+        assert!(!app.add_request, "a 不该穿透去加自选");
+        assert!(!app.scan_request, "r 不该穿透去重扫");
+        assert!(app.ai.is_some());
+    }
+
+    #[test]
+    fn 面板的文本区滚动与重问跟详情屏一致() {
+        let mut app = panel();
+        app.on_key_with(press(KeyCode::Char('?')), rows());
+        app.ai_request = None;
+        app.ai.as_ref().unwrap().max_scroll.set(4);
+        for _ in 0..9 {
+            app.on_key_with(press(KeyCode::Down), rows());
+        }
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 4, "滚到底就不该再往下跑");
+        assert_eq!(app.pick_cursor, 0, "↓ 不该同时挪面板的光标");
+        app.on_key_with(press(KeyCode::Home), rows());
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 0);
+
+        app.on_key_with(press(KeyCode::Char('R')), rows());
+        assert_eq!(app.ai_request, Some(true), "R 要绕过缓存");
+        assert!(matches!(app.ai.as_ref().unwrap().state, AiState::Loading));
     }
 
     #[test]

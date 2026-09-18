@@ -40,14 +40,24 @@ const REFRESH: Duration = Duration::from_secs(3);
 const HISTORY_BARS: usize = 1500;
 /// 腾讯一次最多 100 只。自选股 + 面板通常远不到，截断只是兜底。
 const QUOTE_BATCH: usize = 100;
+/// 解读文本区的底栏提示。详情屏与机会面板共用同一套键位。
+const AI_PANE_HINT: &str = " ↑↓/jk PgUp/PgDn 滚动   Home/End 首尾   R 重新解读   Esc 关闭解读";
 
 /// 一次 AI 解读请求。喂给模型的是算好的 `Signal`，不是原始 K 线。
-struct AiJob {
-    symbol: Symbol,
-    signal: Signal,
-    /// 绕过当天的缓存重问
-    force: bool,
+/// `force` 都表示绕过当天的缓存重问。
+enum AiJob {
+    /// 详情屏：这一只
+    One {
+        symbol: Symbol,
+        signal: Signal,
+        force: bool,
+    },
+    /// 机会面板：当天全部板块 top 一起排序
+    Group { panel: Panel, force: bool },
 }
+
+/// 解读结果是给谁的。`None` = 面板那份整组解读。
+type AiAnswer = (Option<Symbol>, AiState);
 
 /// 后台扫描：起任务、收进度、重装面板都在这里。
 ///
@@ -231,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
 
     // AI：按需解读，沿用 K 线那套「请求走 mpsc、结果走 mpsc」
     let (ai_tx, mut ai_rx) = tokio::sync::mpsc::channel::<AiJob>(4);
-    let (ai_res_tx, mut ai_res_rx) = tokio::sync::mpsc::channel::<(Symbol, AiState)>(8);
+    let (ai_res_tx, mut ai_res_rx) = tokio::sync::mpsc::channel::<AiAnswer>(8);
     let ai_store = Arc::clone(&store);
     let ai_model = cfg.ai_model.clone();
     tokio::spawn(async move {
@@ -249,21 +259,28 @@ async fn main() -> anyhow::Result<()> {
         while let Some(job) = ai_rx.recv().await {
             // 每次都重读端点配置 —— 中途补上 .env 里的 key 不该需要重启
             let ep = ai::Endpoint::from_env(&ai_model).ok();
-            let state = match ai::interpret(
-                &ai_store,
-                &job.symbol,
-                &job.signal,
-                ep,
-                job.force,
-                chrono::Utc::now().date_naive(),
-                |ep, body| ai::post(&client, ep, body),
-            )
-            .await
-            {
+            let day = chrono::Utc::now().date_naive();
+            let (who, answer) = match job {
+                AiJob::One { symbol, signal, force } => {
+                    let r = ai::interpret(&ai_store, &symbol, &signal, ep, force, day, |ep, body| {
+                        ai::post(&client, ep, body)
+                    })
+                    .await;
+                    (Some(symbol), r)
+                }
+                AiJob::Group { panel, force } => {
+                    let r = ai::interpret_panel(&ai_store, &panel, ep, force, day, |ep, body| {
+                        ai::post(&client, ep, body)
+                    })
+                    .await;
+                    (None, r)
+                }
+            };
+            let state = match answer {
                 Ok(text) => AiState::Ready(text),
                 Err(e) => AiState::Failed(e.to_string()),
             };
-            let _ = ai_res_tx.send((job.symbol, state)).await;
+            let _ = ai_res_tx.send((who, state)).await;
         }
     });
     if let Some(d) = &direct {
@@ -310,7 +327,7 @@ async fn run(
     req_tx: &tokio::sync::mpsc::Sender<BarKey>,
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
     ai_tx: &tokio::sync::mpsc::Sender<AiJob>,
-    ai_res_rx: &mut tokio::sync::mpsc::Receiver<(Symbol, AiState)>,
+    ai_res_rx: &mut tokio::sync::mpsc::Receiver<AiAnswer>,
     backend: Backend,
 ) -> anyhow::Result<()> {
     // 十字光标随鼠标动，所以鼠标位置也要纳入重绘判定 —— 否则位图不会刷新
@@ -324,6 +341,8 @@ async fn run(
                                  crate::ui::detail::IndicatorKind::Macd,
                                  crate::ui::viewport::Viewport { span: 0, offset: usize::MAX },
                                  (0, 0), usize::MAX, false);
+    // 一次只许一个解读在飞。整组那份要读几十条 Signal，连按两下就是两份钱
+    let mut ai_inflight = false;
     while !app.should_quit {
         // 扫描进度：只动面板的状态与数据，自选股那条刷新路径完全不受影响（story 44）
         while let Ok(p) = scanner.rx.try_recv() {
@@ -363,40 +382,32 @@ async fn run(
         let (bar_key, bar_state) = bar_rx.borrow().clone();
 
         // 结果先收，再派发本轮的请求
-        while let Ok((sym, state)) = ai_res_rx.try_recv() {
-            // 用户已经翻到别的标的了，就别拿旧标的的解读盖上去
-            if focused(app, watch, panel).as_ref() == Some(&sym)
-                && let Some(pane) = &mut app.ai
-            {
+        while let Ok((who, state)) = ai_res_rx.try_recv() {
+            ai_inflight = false;
+            let fits = match &who {
+                // 整组那份只贴回面板 —— 用户已经进详情屏了就别拿它盖住单只解读
+                None => app.screen == Screen::Opportunities,
+                // 用户已经翻到别的标的了，就别拿旧标的的解读盖上去
+                Some(sym) => focused(app, watch, panel).as_ref() == Some(sym),
+            };
+            if fits && let Some(pane) = &mut app.ai {
                 pane.state = state;
                 pane.scroll = 0;
             }
         }
-        if let Some(force) = app.ai_request.take()
-            && let Some(sym) = focused(app, watch, panel)
-        {
-            // 手上这份数据必须确实是这只标的、这个周期的，否则解读的是别人的信号
-            let fresh = bar_key.as_ref() == Some(&(sym.clone(), app.timeframe));
-            let quote = quotes.iter().find(|q| q.symbol == sym);
-            let signal = fresh
-                .then(|| {
-                    ui::detail::day_signal(&sym, quote, app.timeframe, &bar_state, app.vegas)
-                })
-                .flatten();
-            match signal {
-                Some(signal) => {
-                    let job = AiJob { symbol: sym, signal, force };
-                    if ai_tx.try_send(job).is_err()
-                        && let Some(pane) = &mut app.ai
-                    {
-                        pane.state = AiState::Failed("上一次解读还没回来，稍后再按".into());
-                    }
-                }
-                None => {
+        if let Some(force) = app.ai_request.take() {
+            let job = if ai_inflight {
+                Err("上一次解读还没回来，稍后再按".to_string())
+            } else if app.screen == Screen::Opportunities {
+                group_job(panel, force)
+            } else {
+                one_job(app, watch, panel, &quotes, bar_key.as_ref(), &bar_state, force)
+            };
+            match job {
+                Ok(job) => ai_inflight = ai_tx.try_send(job).is_ok(),
+                Err(why) => {
                     if let Some(pane) = &mut app.ai {
-                        pane.state = AiState::Failed(
-                            "还没有可解读的信号 —— 策略只在日线上求值，先切回日线等 K 线加载完".into(),
-                        );
+                        pane.state = AiState::Failed(why);
                     }
                 }
             }
@@ -475,6 +486,45 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// 面板 `?`：当天全部板块 top 一起交给模型。没有结果就别问 —— 一个空数组
+/// 只会换回一段没内容的话。
+fn group_job(panel: &Panel, force: bool) -> Result<AiJob, String> {
+    if panel.sectors.iter().all(|s| s.picks.is_empty()) {
+        return Err("今天还没有扫描结果可解读 —— 先按 r 扫一次".into());
+    }
+    Ok(AiJob::Group {
+        panel: panel.clone(),
+        force,
+    })
+}
+
+/// 详情屏 `?`：光标这一只。手上这份 K 线必须确实是这只标的、这个周期的，
+/// 否则解读的是别人的信号。
+fn one_job(
+    app: &App,
+    watch: &[Symbol],
+    panel: &Panel,
+    quotes: &[Quote],
+    bar_key: Option<&BarKey>,
+    bar_state: &BarState,
+    force: bool,
+) -> Result<AiJob, String> {
+    let sym = focused(app, watch, panel).ok_or_else(|| "没有选中的标的".to_string())?;
+    let fresh = bar_key == Some(&(sym.clone(), app.timeframe));
+    let quote = quotes.iter().find(|q| q.symbol == sym);
+    let signal = fresh
+        .then(|| ui::detail::day_signal(&sym, quote, app.timeframe, bar_state, app.vegas))
+        .flatten()
+        .ok_or_else(|| {
+            "还没有可解读的信号 —— 策略只在日线上求值，先切回日线等 K 线加载完".to_string()
+        })?;
+    Ok(AiJob::One {
+        symbol: sym,
+        signal,
+        force,
+    })
 }
 
 /// 扫描的闸门：正在跑就不起第二个，只留一句提示。启动自动扫和手动 `r`
@@ -570,24 +620,34 @@ fn draw(
             );
         }
         Screen::Opportunities => {
-            opportunities::render(
-                frame,
-                panes.body,
-                &PanelView {
-                    panel,
-                    status: &app.scan_status,
-                    quotes,
-                    sector_cursor: app.sector_cursor,
-                    pick_cursor: app.pick_cursor,
-                    focus_picks: app.focus_picks,
-                    bp,
-                },
-            );
+            // 文本区开着就盖住整个面板 —— 表和解读并排会把两边都挤成没法看，
+            // 跟详情屏一个待遇
+            if let Some(pane) = ai {
+                ui::detail::render_ai(frame, panes.body, pane);
+            } else {
+                opportunities::render(
+                    frame,
+                    panes.body,
+                    &PanelView {
+                        panel,
+                        status: &app.scan_status,
+                        quotes,
+                        sector_cursor: app.sector_cursor,
+                        pick_cursor: app.pick_cursor,
+                        focus_picks: app.focus_picks,
+                        bp,
+                    },
+                );
+            }
             // 提示占掉底栏那一行 —— 面板里没有别的地方能放一句「已在自选」
-            let hint = match &app.notice {
-                Some(n) => format!(" {n}"),
-                None => " ↑↓ 选板块   Tab 切到标的列表   Enter 详情   a 加自选   r 重扫   Esc 返回"
-                    .to_string(),
+            let hint = if ai.is_some() {
+                AI_PANE_HINT.to_string()
+            } else {
+                match &app.notice {
+                    Some(n) => format!(" {n}"),
+                    None => " ↑↓ 选板块   Tab 切标的   Enter 详情   a 加自选   ? AI 解读   r 重扫   Esc 返回"
+                        .to_string(),
+                }
             };
             frame.render_widget(
                 Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
@@ -625,7 +685,7 @@ fn draw(
                 );
             }
             let hint = if ai.is_some() {
-                " ↑↓/jk PgUp/PgDn 滚动   Home/End 首尾   R 重新解读   Esc 关闭解读"
+                AI_PANE_HINT
             } else {
                 " ←→ 滚动   =- 缩放/滚轮   鼠标悬停读数   Tab 切周期   ↑↓ 切标的   i 切指标   ? AI 解读   Esc 返回"
             };
@@ -1101,6 +1161,8 @@ mod panel_render_tests {
                     stance: "long".into(),
                     fresh_bars: Some(2),
                     facets: "预备↑ 位置↑ 确认↑ 趋势→ 过滤↓".into(),
+                    facets_json: r#"[{"label":"趋势","state":"↑","detail":"慢隧道向上倾斜"}]"#
+                        .into(),
                 }],
             }],
         }
@@ -1169,6 +1231,51 @@ mod panel_render_tests {
                         Some(sw)
                     })
                     .sum();
+                assert_eq!(line_w, w as usize, "{w}x{h} 第 {y} 行宽度 {line_w} != {w}");
+            }
+        }
+    }
+
+    fn ai_app(text: &str) -> App {
+        let mut app = panel_app();
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(text.into()),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        app
+    }
+
+    #[test]
+    fn 面板底栏告诉用户按问号要整组解读() {
+        let buf = render_full(140, 40, &panel_app(), &BarState::Loading, &panel());
+        assert!(text_of(&buf, 140, 40).contains("? AI 解读"), "底栏要告诉用户按哪个键");
+    }
+
+    #[test]
+    fn 面板的解读文本区盖住两张表并换掉底栏提示() {
+        let app = ai_app("机器生成的策略分析，不构成投资建议\n\n1. 祥鑫科技：确认刚成立 2 根。");
+        let t = text_of(&render_full(140, 40, &app, &BarState::Loading, &panel()), 140, 40);
+        assert!(t.contains("AI 解读"), "{t}");
+        assert!(t.contains("不构成投资建议"), "免责声明必须在屏幕上：{t}");
+        assert!(t.contains("Esc 关闭解读"), "底栏要换成文本区的键位：{t}");
+        assert!(!t.contains("板块热度"), "文本区开着时不该还画板块表：{t}");
+    }
+
+    #[test]
+    fn 面板解读打开时各尺寸不panic且每行宽度等于终端宽() {
+        let app = ai_app(&"机器生成的策略分析，不构成投资建议。祥鑫科技确认刚成立，维度不打架。".repeat(8));
+        let p = panel();
+        for (w, h) in [(40u16, 24u16), (60, 24), (80, 24), (140, 40), (240, 70)] {
+            let buf = render_full(w, h, &app, &BarState::Loading, &p);
+            for y in 0..h {
+                let mut line_w = 0usize;
+                let mut x = 0u16;
+                while x < w {
+                    let sw = buf[(x, y)].symbol().width().max(1);
+                    line_w += sw;
+                    x += sw as u16;
+                }
                 assert_eq!(line_w, w as usize, "{w}x{h} 第 {y} 行宽度 {line_w} != {w}");
             }
         }

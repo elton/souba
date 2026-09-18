@@ -11,9 +11,11 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 use serde_json::{Value, json};
 
-use crate::core::strategy::{FacetState, Signal};
+use crate::core::strategy::{FacetState, Signal, Stance};
 use crate::core::symbol::Symbol;
+use crate::scan::evaluate::BACKFILLING;
 use crate::store::Store;
+use crate::ui::opportunities::Panel;
 
 /// 回答的第一行。少一个字都算这个工具在说谎。
 pub const DISCLAIMER: &str = "机器生成的策略分析，不构成投资建议";
@@ -49,6 +51,25 @@ detail（这个维度为什么是这个状态）。五个维度分别是：\
 4. 不要给买卖指令，不要给目标价、止损价或仓位建议，不要预测涨跌幅。
 5. 不要自己重算指标，JSON 里没有的数字一个都不要编。
 6. 控制在 300 字以内。";
+
+/// 整组解读在 system 后面追加的那一段。单只那份提示词照旧生效，
+/// 这里只补「这次的输入是一个数组」和排序要求。
+pub const PANEL_SYSTEM_SUFFIX: &str = "
+
+这一次用户给你的是一个 JSON 数组，每个元素是当天某个板块 top 里的一只。\
+除上面那些字段外，每个元素还带 sector（板块名）、sector_kind（行业还是概念）、\
+sector_heat（板块热度，越大越热）、name（标的名称）。\
+注意这一份里 facets 的 state 是箭头：↑ 看多、→ 中性、↓ 看空。
+
+排序要求：请按机会的新鲜度与维度一致性排序并说明理由 —— \
+fresh_bars 越小表示确认刚刚成立，五个维度互不打架的比彼此矛盾的更可信。\
+先给一份排好序的名单，再逐只用一两句说明它为什么排在那个位置。\
+上面第 6 条的 300 字上限这一次不适用，但每只不要超过两句。";
+
+/// 整组解读的 system 提示词。
+pub fn panel_system_prompt() -> String {
+    format!("{SYSTEM_PROMPT}{PANEL_SYSTEM_SUFFIX}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
@@ -172,6 +193,41 @@ pub fn user_prompt(symbol: &Symbol, signal: &Signal) -> String {
     serde_json::to_string(&v).expect("Signal 的 JSON 化不会失败")
 }
 
+/// 面板整组 → user 消息。同样是纯函数，缓存键算在它的输出上。
+///
+/// **回补中的行不进这个数组** —— 它们的 `facets_json` 是空数组、`stance` 不是策略
+/// 判定，喂进去只能让模型编。但也不能当它们不存在：末尾注明还有几只在补，
+/// 否则板块 top 看着莫名其妙地短。
+pub fn panel_prompt(panel: &Panel) -> String {
+    let mut items: Vec<Value> = Vec::new();
+    let mut backfilling = 0usize;
+    for sector in &panel.sectors {
+        for p in &sector.picks {
+            if p.stance == BACKFILLING {
+                backfilling += 1;
+                continue;
+            }
+            items.push(json!({
+                "sector": sector.name,
+                "sector_kind": sector.kind.label(),
+                "sector_heat": sector.heat.heat,
+                "symbol": p.symbol.to_string(),
+                "name": p.name,
+                // 库里存的是稳定标识，模型读的是中文；认不出来就原样给它
+                "stance": Stance::parse(&p.stance).map_or(p.stance.as_str(), |s| s.label()),
+                "fresh_bars": p.fresh_bars,
+                "facets": serde_json::from_str::<Value>(&p.facets_json).unwrap_or(Value::Null),
+            }));
+        }
+    }
+    let arr = serde_json::to_string(&Value::Array(items)).expect("面板的 JSON 化不会失败");
+    if backfilling == 0 {
+        arr
+    } else {
+        format!("{arr}\n另有 {backfilling} 只回补中：历史还没补齐，没有信号可解释，没有列进上面这组。")
+    }
+}
+
 /// FNV-1a 64。
 ///
 /// 缓存键不需要密码学强度，而 `sha2` 并不在本项目当前 target 的依赖树里
@@ -191,11 +247,11 @@ pub fn cache_key(user_json: &str, day: NaiveDate) -> String {
 }
 
 /// chat completions 请求体。`enable_thinking` 与 `stream` 都必须是 false。
-pub fn request_body(ep: &Endpoint, user_json: &str) -> Value {
+pub fn request_body(ep: &Endpoint, system: &str, user_json: &str) -> Value {
     json!({
         "model": ep.model,
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "system", "content": system },
             { "role": "user", "content": user_json },
         ],
         "enable_thinking": false,
@@ -257,14 +313,49 @@ where
     Fut: std::future::Future<Output = Result<String, AiError>>,
 {
     let user = user_prompt(symbol, signal);
-    let key = cache_key(&user, day);
+    interpret_json(store, SYSTEM_PROMPT, &user, endpoint, force, day, send).await
+}
+
+/// 面板整组解读。除了提示词，流程与单只完全一致 —— 缓存键算在输入 JSON 上，
+/// 两种输入长得完全不同，键自然不会撞。
+pub async fn interpret_panel<F, Fut>(
+    store: &Store,
+    panel: &Panel,
+    endpoint: Option<Endpoint>,
+    force: bool,
+    day: NaiveDate,
+    send: F,
+) -> Result<String, AiError>
+where
+    F: FnOnce(Endpoint, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AiError>>,
+{
+    let user = panel_prompt(panel);
+    interpret_json(store, &panel_system_prompt(), &user, endpoint, force, day, send).await
+}
+
+/// 两种解读共用的那一段：查缓存 → 组请求 → 发 → 补免责声明 → 落缓存。
+async fn interpret_json<F, Fut>(
+    store: &Store,
+    system: &str,
+    user: &str,
+    endpoint: Option<Endpoint>,
+    force: bool,
+    day: NaiveDate,
+    send: F,
+) -> Result<String, AiError>
+where
+    F: FnOnce(Endpoint, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AiError>>,
+{
+    let key = cache_key(user, day);
     if !force
         && let Ok(Some(hit)) = store.ai_cached(&key)
     {
         return Ok(hit);
     }
     let ep = endpoint.ok_or(AiError::MissingKey)?;
-    let body = request_body(&ep, &user);
+    let body = request_body(&ep, system, user);
     let answer = ensure_disclaimer(&send(ep, body).await?);
     // 缓存写失败不该毁掉一个已经拿到的回答 —— 大不了下次重问
     let _ = store.ai_cache_put(&key, &answer);
@@ -418,7 +509,7 @@ mod tests {
 
     #[test]
     fn 请求体关掉思考与流式() {
-        let b = request_body(&ep(), "{}");
+        let b = request_body(&ep(), SYSTEM_PROMPT, "{}");
         assert_eq!(b["model"], "qwen3.7-flash");
         assert_eq!(b["enable_thinking"], false, "思考模式 93% 的输出都是 reasoning，必须关");
         assert_eq!(b["stream"], false);
@@ -649,6 +740,115 @@ mod tests {
         assert_eq!(st.ai_cached(&key).unwrap(), None);
     }
 
+    // ── 整组解读
+
+    fn 面板(回补: usize) -> Panel {
+        use crate::core::sector::{Heat, SectorKind};
+        use crate::ui::opportunities::{PanelPick, PanelSector};
+        let mk = |code: &str, name: &str, stance: &str, fresh: Option<i64>| PanelPick {
+            symbol: Symbol::parse(code).unwrap(),
+            name: name.into(),
+            stance: stance.into(),
+            fresh_bars: fresh,
+            facets: "预备↑ 位置↑".into(),
+            facets_json: r#"[{"label":"趋势","state":"↑","detail":"慢隧道向上倾斜"},{"label":"确认","state":"→","detail":"EMA12 仍在快隧道内"}]"#.into(),
+        };
+        let mut picks = vec![
+            mk("CN:002965", "祥鑫科技", "long", Some(2)),
+            mk("CN:600519", "贵州茅台", "watch", None),
+        ];
+        for i in 0..回补 {
+            picks.push(PanelPick {
+                facets_json: "[]".into(),
+                facets: String::new(),
+                ..mk(&format!("CN:30000{i}"), "回补的", BACKFILLING, None)
+            });
+        }
+        Panel {
+            date: "2026-09-18".into(),
+            sectors: vec![PanelSector {
+                name: "华为汽车".into(),
+                kind: SectorKind::Concept,
+                heat: Heat {
+                    heat: 12.5,
+                    turnover_ratio: Some(3.0),
+                    cum_change: 9.5,
+                    today_change: 3.2,
+                },
+                picks,
+            }],
+        }
+    }
+
+    #[test]
+    fn 整组提示词是数组每个元素带板块归属与该行判定() {
+        let j = panel_prompt(&面板(0));
+        let v: Vec<Value> = serde_json::from_str(&j).unwrap();
+        assert_eq!(v.len(), 2, "两只都该在里面：{j}");
+        assert_eq!(v[0]["sector"], "华为汽车");
+        assert_eq!(v[0]["sector_kind"], "概念");
+        assert_eq!(v[0]["sector_heat"], 12.5);
+        assert_eq!(v[0]["symbol"], "CN:002965");
+        assert_eq!(v[0]["name"], "祥鑫科技");
+        assert_eq!(v[0]["stance"], "做多", "库里的稳定标识要翻成模型读的中文");
+        assert_eq!(v[0]["fresh_bars"], 2);
+        let f = v[0]["facets"].as_array().unwrap();
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0]["label"], "趋势");
+        assert_eq!(f[0]["state"], "↑");
+        assert_eq!(f[0]["detail"], "慢隧道向上倾斜", "detail 不能丢，那才是要解释的东西");
+        assert!(v[1]["fresh_bars"].is_null(), "没确认就是 null，不是 0");
+    }
+
+    #[test]
+    fn 回补中的行不喂模型但要注明还有几只() {
+        let j = panel_prompt(&面板(3));
+        let (arr, note) = j.split_once('\n').expect("有回补时末尾要有一行说明");
+        let v: Vec<Value> = serde_json::from_str(arr).unwrap();
+        assert_eq!(v.len(), 2, "回补中的行没有信号可解释，不该进数组");
+        assert!(note.contains("另有 3 只回补中"), "{note}");
+        // 没有回补时不该凭空多出这句
+        assert!(!panel_prompt(&面板(0)).contains("回补中"));
+    }
+
+    #[test]
+    fn 整组提示词逐字节稳定且与单只不撞键() {
+        let g = panel_prompt(&面板(0));
+        assert_eq!(g, panel_prompt(&面板(0)));
+        let one = user_prompt(&sym(), &sig());
+        assert_ne!(cache_key(&g, day()), cache_key(&one, day()));
+    }
+
+    #[test]
+    fn 整组的system保留免责声明并要求排序() {
+        let sp = panel_system_prompt();
+        assert!(sp.starts_with(SYSTEM_PROMPT), "单只那份要求一条都不能少");
+        assert!(sp.contains(DISCLAIMER), "免责声明的要求必须还在");
+        assert!(sp.contains("排序"), "整组解读的活就是排序：{sp}");
+        assert!(sp.contains("新鲜度"));
+        assert!(sp.contains("↑"), "这一份 facets 的 state 是箭头，得跟模型交代");
+    }
+
+    #[tokio::test]
+    async fn 整组解读同一天命中缓存force重问() {
+        let st = store();
+        let hits = AtomicUsize::new(0);
+        let p = 面板(0);
+        let first = interpret_panel(&st, &p, Some(ep()), false, day(), counting(&hits, "第一次"))
+            .await
+            .unwrap();
+        assert!(first.starts_with(DISCLAIMER), "{first}");
+        interpret_panel(&st, &p, Some(ep()), false, day(), counting(&hits, "第二次"))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "同一组同一天不该再打网络");
+        let again = interpret_panel(&st, &p, Some(ep()), true, day(), counting(&hits, "重问的"))
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(again.contains("重问的"));
+    }
+
     /// 真实问一次。默认不跑：`cargo test -- --ignored 联网`
     #[tokio::test]
     #[ignore = "需要外网与 .env 里的 LLM_API_KEY"]
@@ -658,10 +858,27 @@ mod tests {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap();
-        let body = request_body(&ep, &user_prompt(&sym(), &sig()));
+        let body = request_body(&ep, SYSTEM_PROMPT, &user_prompt(&sym(), &sig()));
         let raw = post(&client, ep, body).await.expect("端点应可用");
         let answer = ensure_disclaimer(&raw);
         println!("---- 模型回答 ----\n{answer}\n------------------");
+        assert!(!raw.trim().is_empty(), "回答不能为空");
+        assert!(answer.starts_with(DISCLAIMER));
+    }
+
+    /// 整组真实问一次。默认不跑：`cargo test -- --ignored 联网`
+    #[tokio::test]
+    #[ignore = "需要外网与 .env 里的 LLM_API_KEY"]
+    async fn 联网冒烟整组排序解读一次() {
+        let ep = Endpoint::from_env("").expect("需要 .env 里的 LLM_API_KEY");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap();
+        let body = request_body(&ep, &panel_system_prompt(), &panel_prompt(&面板(1)));
+        let raw = post(&client, ep, body).await.expect("端点应可用");
+        let answer = ensure_disclaimer(&raw);
+        println!("---- 整组回答 ----\n{answer}\n------------------");
         assert!(!raw.trim().is_empty(), "回答不能为空");
         assert!(answer.starts_with(DISCLAIMER));
     }

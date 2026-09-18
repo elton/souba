@@ -36,6 +36,9 @@ pub struct PanelPick {
     pub fresh_bars: Option<i64>,
     /// 五维度缩写，已拼成「预备↑ 位置↑ …」
     pub facets: String,
+    /// 库里那份 facets 原文（label/state/detail）。喂给模型的是它，
+    /// 缩写串丢掉了 detail —— 「为什么是这个状态」恰恰是要解释的东西。
+    pub facets_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,7 @@ pub fn load(
                 stance: r.stance.clone(),
                 fresh_bars: r.freshness,
                 facets: facets_label(&r.facets_json),
+                facets_json: r.facets_json.clone(),
             })
             .collect();
         sectors.push(PanelSector {
@@ -541,6 +545,7 @@ mod tests {
             stance: stance.into(),
             fresh_bars: fresh,
             facets: "预备↑ 位置↑ 确认↑ 趋势→ 过滤↓".into(),
+            facets_json: r#"[{"label":"预备","state":"↑","detail":"价格回到隧道内等待"}]"#.into(),
         }
     }
 
