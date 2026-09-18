@@ -15,8 +15,20 @@ function gbkFixture(): Uint8Array {
 const KEY = 'test-key'
 
 beforeEach(async () => {
-  await env.DB.exec('DELETE FROM bars')
-  await env.DB.exec('DELETE FROM sync_state')
+  for (const t of [
+    'bars',
+    'sync_state',
+    'watchlist',
+    'settings',
+    'sectors',
+    'sector_daily',
+    'sector_members',
+    'scan_results',
+    'adj_factors',
+    'backfill_state',
+  ]) {
+    await env.DB.exec(`DELETE FROM ${t}`)
+  }
 })
 
 function post(path: string, body: unknown, key: string | null = KEY) {
@@ -302,5 +314,246 @@ describe('Cron 的失败处理', () => {
       .bind('last_append:CN')
       .first()
     expect(state).toBeNull()
+  })
+})
+
+// ── 整表交换与板块增量 ──────────────────────────────────────────────────────
+
+function put(path: string, body: unknown, key: string | null = KEY) {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (key !== null) headers['X-Souba-Key'] = key
+  return new Request(`https://x${path}`, { method: 'PUT', headers, body: JSON.stringify(body) })
+}
+
+const WL = { symbol: 'CN:600519', name: '贵州茅台', sort_order: 1, added_at: 100, updated_at: 200 }
+
+describe('GET|PUT /sync/watchlist', () => {
+  it('缺密钥的 GET 与 PUT 都是 401', async () => {
+    expect((await call(get('/sync/watchlist', null))).status).toBe(401)
+    expect((await call(put('/sync/watchlist', [WL], null))).status).toBe(401)
+  })
+
+  it('整表写入后原样读回', async () => {
+    expect((await call(put('/sync/watchlist', [WL]))).status).toBe(200)
+    const body = await (await call(get('/sync/watchlist'))).json<{ watchlist: unknown[] }>()
+    expect(body.watchlist).toEqual([WL])
+  })
+
+  it('重复提交幂等', async () => {
+    await call(put('/sync/watchlist', [WL]))
+    await call(put('/sync/watchlist', [WL]))
+    const body = await (await call(get('/sync/watchlist'))).json<{ watchlist: unknown[] }>()
+    expect(body.watchlist).toEqual([WL])
+  })
+
+  it('updated_at 更新的覆盖旧的', async () => {
+    await call(put('/sync/watchlist', [WL]))
+    await call(put('/sync/watchlist', [{ ...WL, name: '茅台', updated_at: 300 }]))
+    const body = await (await call(get('/sync/watchlist'))).json<{ watchlist: { name: string }[] }>()
+    expect(body.watchlist[0].name).toBe('茅台')
+  })
+
+  it('updated_at 更旧的不覆盖新的', async () => {
+    await call(put('/sync/watchlist', [{ ...WL, updated_at: 300 }]))
+    await call(put('/sync/watchlist', [{ ...WL, name: '旧名字', updated_at: 299 }]))
+    const body = await (await call(get('/sync/watchlist'))).json<{
+      watchlist: { name: string; updated_at: number }[]
+    }>()
+    expect(body.watchlist[0]).toMatchObject({ name: '贵州茅台', updated_at: 300 })
+  })
+
+  it('updated_at 相等时后写者生效', async () => {
+    await call(put('/sync/watchlist', [WL]))
+    await call(put('/sync/watchlist', [{ ...WL, name: '同刻' }]))
+    const body = await (await call(get('/sync/watchlist'))).json<{ watchlist: { name: string }[] }>()
+    expect(body.watchlist[0].name).toBe('同刻')
+  })
+
+  it('不删远端多出来的行', async () => {
+    await call(put('/sync/watchlist', [WL, { ...WL, symbol: 'CN:000001' }]))
+    await call(put('/sync/watchlist', [WL]))
+    const body = await (await call(get('/sync/watchlist'))).json<{ watchlist: unknown[] }>()
+    expect(body.watchlist).toHaveLength(2)
+  })
+
+  it('body 不是数组返回 400，字段缺失返回 400', async () => {
+    expect((await call(put('/sync/watchlist', { rows: [] }))).status).toBe(400)
+    expect((await call(put('/sync/watchlist', [{ symbol: 'CN:600519' }]))).status).toBe(400)
+  })
+
+  it('超过单次上限返回 413', async () => {
+    const many = Array.from({ length: 2001 }, (_, i) => ({ ...WL, symbol: `CN:${i}` }))
+    expect((await call(put('/sync/watchlist', many))).status).toBe(413)
+  })
+
+  it('只支持 GET / PUT', async () => {
+    expect((await call(post('/sync/watchlist', [WL]))).status).toBe(405)
+  })
+})
+
+describe('GET|PUT /sync/settings', () => {
+  const S = { key: 'ema.fast', value: '144', updated_at: 200 }
+
+  it('缺密钥 401', async () => {
+    expect((await call(get('/sync/settings', null))).status).toBe(401)
+    expect((await call(put('/sync/settings', [S], null))).status).toBe(401)
+  })
+
+  it('整表写入后读回', async () => {
+    await call(put('/sync/settings', [S]))
+    const body = await (await call(get('/sync/settings'))).json<{ settings: unknown[] }>()
+    expect(body.settings).toEqual([S])
+  })
+
+  it('updated_at 更旧的不覆盖新的', async () => {
+    await call(put('/sync/settings', [{ ...S, updated_at: 300 }]))
+    await call(put('/sync/settings', [{ ...S, value: '169', updated_at: 299 }]))
+    const body = await (await call(get('/sync/settings'))).json<{ settings: { value: string }[] }>()
+    expect(body.settings[0].value).toBe('144')
+  })
+})
+
+describe('POST|GET /sync/sectors', () => {
+  const SECTOR = { market: 'CN', code: 'BK0475', name: '银行', kind: '行业', updated_at: 200 }
+  const DAILY = {
+    market: 'CN',
+    sector_code: 'BK0475',
+    date: '2026-09-18',
+    change_pct: 1.2,
+    turnover: 3.4e10,
+  }
+  const MEMBER = {
+    market: 'CN',
+    sector_code: 'BK0475',
+    symbol: 'CN:600519',
+    name: '贵州茅台',
+    as_of: '2026-09-18',
+    rank: 1,
+  }
+  const SCAN = {
+    date: '2026-09-18',
+    market: 'CN',
+    sector_code: 'BK0475',
+    symbol: 'CN:600519',
+    rank: 1,
+    stance: 'Long',
+    freshness: 3,
+    facets_json: '{}',
+  }
+  const FACTOR = { symbol: 'CN:600519', effective_date: '2026-06-30', factor: 1.02 }
+  const BACKFILL = { symbol: 'CN:600519', timeframe: '1d', status: 'done', updated_at: 200 }
+
+  const ALL = {
+    sectors: [SECTOR],
+    sector_daily: [DAILY],
+    sector_members: [MEMBER],
+    scan_results: [SCAN],
+    adj_factors: [FACTOR],
+    backfill_state: [BACKFILL],
+  }
+
+  it('缺密钥 401', async () => {
+    expect((await call(post('/sync/sectors', ALL, null))).status).toBe(401)
+    expect((await call(get('/sync/sectors?since=0&since_date=1970-01-01', null))).status).toBe(401)
+  })
+
+  it('六张表一次写入，全部可读回', async () => {
+    expect((await call(post('/sync/sectors', ALL))).status).toBe(200)
+    const body = await (
+      await call(get('/sync/sectors?since=0&since_date=1970-01-01'))
+    ).json<Record<string, unknown>>()
+    expect(body.sectors).toEqual([SECTOR])
+    expect(body.sector_daily).toEqual([DAILY])
+    expect(body.sector_members).toEqual([MEMBER])
+    expect(body.scan_results).toEqual([SCAN])
+    expect(body.adj_factors).toEqual([FACTOR])
+    expect(body.backfill_state).toEqual([BACKFILL])
+  })
+
+  it('数组可以缺省', async () => {
+    const res = await call(post('/sync/sectors', { sectors: [SECTOR] }))
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ upserted: 1 })
+  })
+
+  it('同主键重复提交幂等，后写的值生效', async () => {
+    await call(post('/sync/sectors', ALL))
+    await call(post('/sync/sectors', { sectors: [{ ...SECTOR, name: '银行Ⅱ', updated_at: 300 }] }))
+    const body = await (
+      await call(get('/sync/sectors?since=0&since_date=1970-01-01'))
+    ).json<{ sectors: { name: string }[] }>()
+    expect(body.sectors).toEqual([{ ...SECTOR, name: '银行Ⅱ', updated_at: 300 }])
+  })
+
+  it('freshness 允许为 null', async () => {
+    await call(post('/sync/sectors', { scan_results: [{ ...SCAN, stance: 'Flat', freshness: null }] }))
+    const body = await (
+      await call(get('/sync/sectors?since=0&since_date=1970-01-01'))
+    ).json<{ scan_results: { freshness: number | null }[] }>()
+    expect(body.scan_results[0].freshness).toBeNull()
+  })
+
+  it('updated_at 游标只回严格更新的行', async () => {
+    await call(post('/sync/sectors', ALL))
+    const body = await (
+      await call(get('/sync/sectors?since=200&since_date=1970-01-01'))
+    ).json<Record<string, unknown[]>>()
+    expect(body.sectors).toEqual([])
+    expect(body.backfill_state).toEqual([])
+    // 日期游标的表不受 since 影响
+    expect(body.sector_daily).toHaveLength(1)
+  })
+
+  it('date 游标按 >= 取，同一天的行会重新回传', async () => {
+    await call(post('/sync/sectors', ALL))
+    const same = await (
+      await call(get('/sync/sectors?since=0&since_date=2026-09-18'))
+    ).json<Record<string, unknown[]>>()
+    expect(same.sector_daily).toHaveLength(1)
+    expect(same.sector_members).toHaveLength(1)
+    expect(same.scan_results).toHaveLength(1)
+
+    const later = await (
+      await call(get('/sync/sectors?since=0&since_date=2026-09-19'))
+    ).json<Record<string, unknown[]>>()
+    expect(later.sector_daily).toEqual([])
+    expect(later.sector_members).toEqual([])
+    expect(later.scan_results).toEqual([])
+    // adj_factors 的游标是 effective_date
+    expect(later.adj_factors).toEqual([])
+  })
+
+  it('next 是两个游标的最大值，没有新行时原样回传请求的游标', async () => {
+    await call(post('/sync/sectors', ALL))
+    const body = await (
+      await call(get('/sync/sectors?since=0&since_date=1970-01-01'))
+    ).json<{ next: { since: number; since_date: string } }>()
+    expect(body.next).toEqual({ since: 200, since_date: '2026-09-18' })
+
+    const empty = await (
+      await call(get('/sync/sectors?since=999&since_date=2030-01-01'))
+    ).json<{ next: { since: number; since_date: string } }>()
+    expect(empty.next).toEqual({ since: 999, since_date: '2030-01-01' })
+  })
+
+  it('总行数超过上限返回 413', async () => {
+    const daily = Array.from({ length: 1999 }, (_, i) => ({ ...DAILY, sector_code: `BK${i}` }))
+    expect((await call(post('/sync/sectors', { ...ALL, sector_daily: daily }))).status).toBe(413)
+  })
+
+  it('未知表名与字段缺失返回 400', async () => {
+    expect((await call(post('/sync/sectors', { nope: [{}] }))).status).toBe(400)
+    expect((await call(post('/sync/sectors', { sectors: [{ market: 'CN' }] }))).status).toBe(400)
+    expect((await call(post('/sync/sectors', { sectors: '不是数组' }))).status).toBe(400)
+  })
+
+  it('缺少游标参数返回 400', async () => {
+    expect((await call(get('/sync/sectors?since=0'))).status).toBe(400)
+    expect((await call(get('/sync/sectors?since_date=1970-01-01'))).status).toBe(400)
+    expect((await call(get('/sync/sectors?since=0&since_date=昨天'))).status).toBe(400)
+  })
+
+  it('只支持 GET / POST', async () => {
+    expect((await call(put('/sync/sectors', ALL))).status).toBe(405)
   })
 })

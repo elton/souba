@@ -331,6 +331,215 @@ async function getBars(url: URL, env: Env): Promise<Response> {
   return Response.json({ bars: rows, next: rows.length ? rows[rows.length - 1].ts : null })
 }
 
+// ── 整表交换与板块增量 ─────────────────────────────────────────────────────
+
+/** 列名一律加引号：sector_members / scan_results 里的 `rank` 是 SQLite 的窗口函数名 */
+function q(ident: string): string {
+  return `"${ident}"`
+}
+
+interface TableDef {
+  /** 全部列，也是 GET 回传与 POST 必填的字段 */
+  cols: readonly string[]
+  /** 主键列，用于 ON CONFLICT */
+  keys: readonly string[]
+}
+
+/** 唯一允许为 NULL 的列（0002 里 scan_results.freshness 之外全是 NOT NULL） */
+const NULLABLE = new Set(['freshness'])
+
+/** `updated_at >= 库里那行` 才覆盖：后写者胜的规则在服务端也守一遍 */
+const FULL_TABLES: Record<string, TableDef> = {
+  watchlist: {
+    cols: ['symbol', 'name', 'sort_order', 'added_at', 'updated_at'],
+    keys: ['symbol'],
+  },
+  settings: { cols: ['key', 'value', 'updated_at'], keys: ['key'] },
+}
+
+/**
+ * `/sync/sectors` 交换的六张表。`cursor` 是增量游标列：
+ * 有 `updated_at` 的按 unix 秒严格大于；0002 里没给 `updated_at` 的表只能拿业务日期
+ * 当游标，按 `>=` 取 —— 同一天的行会重复回传，而 upsert 幂等，重传无害、漏传有害。
+ */
+const SECTOR_TABLES: Record<string, TableDef & { cursor: string }> = {
+  sectors: {
+    cols: ['market', 'code', 'name', 'kind', 'updated_at'],
+    keys: ['market', 'code'],
+    cursor: 'updated_at',
+  },
+  sector_daily: {
+    cols: ['market', 'sector_code', 'date', 'change_pct', 'turnover'],
+    keys: ['market', 'sector_code', 'date'],
+    cursor: 'date',
+  },
+  sector_members: {
+    cols: ['market', 'sector_code', 'symbol', 'name', 'as_of', 'rank'],
+    keys: ['market', 'sector_code', 'as_of', 'symbol'],
+    cursor: 'as_of',
+  },
+  scan_results: {
+    cols: ['date', 'market', 'sector_code', 'symbol', 'rank', 'stance', 'freshness', 'facets_json'],
+    keys: ['date', 'market', 'sector_code', 'symbol'],
+    cursor: 'date',
+  },
+  adj_factors: {
+    cols: ['symbol', 'effective_date', 'factor'],
+    keys: ['symbol', 'effective_date'],
+    cursor: 'effective_date',
+  },
+  backfill_state: {
+    cols: ['symbol', 'timeframe', 'status', 'updated_at'],
+    keys: ['symbol', 'timeframe'],
+    cursor: 'updated_at',
+  },
+}
+
+function upsertSql(table: string, def: TableDef): string {
+  const set = def.cols
+    .filter((c) => !def.keys.includes(c))
+    .map((c) => `${q(c)} = excluded.${q(c)}`)
+    .join(', ')
+  return `INSERT INTO ${q(table)} (${def.cols.map(q).join(', ')})
+VALUES (${def.cols.map((_, i) => `?${i + 1}`).join(', ')})
+ON CONFLICT (${def.keys.map(q).join(', ')}) DO UPDATE SET ${set}`
+}
+
+/** 字段齐了才绑；缺一列或类型不对就整批拒绝，宁可 400 也不往库里写半行 */
+function bindRow(
+  stmt: D1PreparedStatement,
+  cols: readonly string[],
+  raw: unknown,
+): D1PreparedStatement | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const r = raw as Record<string, unknown>
+  const vals: (string | number | null)[] = []
+  for (const c of cols) {
+    const v = r[c]
+    if (v === null || v === undefined) {
+      if (!NULLABLE.has(c)) return null
+      vals.push(null)
+    } else if (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))) {
+      vals.push(v)
+    } else {
+      return null
+    }
+  }
+  return stmt.bind(...vals)
+}
+
+async function readJson(req: Request): Promise<unknown> {
+  try {
+    return await req.json()
+  } catch {
+    return undefined
+  }
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+// ── /sync/watchlist、/sync/settings ────────────────────────────────────────
+
+async function getFullTable(table: string, env: Env): Promise<Response> {
+  const def = FULL_TABLES[table]
+  const { results } = await env.DB.prepare(
+    `SELECT ${def.cols.map(q).join(', ')} FROM ${q(table)} ORDER BY ${q(def.keys[0])}`,
+  ).all()
+  return Response.json({ [table]: results })
+}
+
+async function putFullTable(table: string, req: Request, env: Env): Promise<Response> {
+  const def = FULL_TABLES[table]
+  const rows = await readJson(req)
+  if (!Array.isArray(rows)) return bad(`${table} 的 body 必须是整表数组`)
+  if (rows.length > MAX_POST_BARS) return bad(`一次最多 ${MAX_POST_BARS} 行，请分片推送`, 413)
+
+  // 传入行的 updated_at 不新于库里那行就不覆盖 —— 客户端已经合并过一次，
+  // 这里是第二道：两台机器乱序推上来时，旧值不会盖掉新值。
+  const upsert = env.DB.prepare(`${upsertSql(table, def)}
+WHERE excluded."updated_at" >= ${q(table)}."updated_at"`)
+  const stmts: D1PreparedStatement[] = []
+  for (const raw of rows) {
+    const stmt = bindRow(upsert, def.cols, raw)
+    if (!stmt) return bad(`${table} 行字段缺失或类型不对`)
+    stmts.push(stmt)
+  }
+  await writeInBatches(env, stmts)
+  return Response.json({ upserted: stmts.length })
+}
+
+// ── /sync/sectors ──────────────────────────────────────────────────────────
+
+async function postSectors(req: Request, env: Env): Promise<Response> {
+  const body = await readJson(req)
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return bad('请求体必须是按表名分组的对象')
+  }
+  const groups = body as Record<string, unknown>
+  for (const table of Object.keys(groups)) {
+    if (!SECTOR_TABLES[table]) return bad(`未知的表：${table}`)
+    if (!Array.isArray(groups[table])) return bad(`${table} 必须是数组`)
+  }
+  const total = Object.values(groups).reduce<number>((n, rows) => n + (rows as unknown[]).length, 0)
+  if (total > MAX_POST_BARS) return bad(`一次最多 ${MAX_POST_BARS} 行，请分片推送`, 413)
+
+  const stmts: D1PreparedStatement[] = []
+  for (const [table, def] of Object.entries(SECTOR_TABLES)) {
+    const rows = groups[table]
+    if (!Array.isArray(rows)) continue
+    const upsert = env.DB.prepare(upsertSql(table, def))
+    for (const raw of rows) {
+      const stmt = bindRow(upsert, def.cols, raw)
+      if (!stmt) return bad(`${table} 行字段缺失或类型不对`)
+      stmts.push(stmt)
+    }
+  }
+  await writeInBatches(env, stmts)
+  return Response.json({ upserted: stmts.length })
+}
+
+async function getSectors(url: URL, env: Env): Promise<Response> {
+  const rawSince = url.searchParams.get('since')
+  const sinceDate = url.searchParams.get('since_date')
+  const since = Number(rawSince)
+  if (rawSince === null || !Number.isFinite(since)) return bad('since 缺失或不是数字')
+  if (sinceDate === null || !DATE_RE.test(sinceDate)) return bad('since_date 缺失或不是 YYYY-MM-DD')
+
+  const out: Record<string, unknown> = {}
+  let nextSince = since
+  let nextDate = sinceDate
+
+  for (const [table, def] of Object.entries(SECTOR_TABLES)) {
+    const unix = def.cursor === 'updated_at'
+    const { results } = await env.DB.prepare(
+      `SELECT ${def.cols.map(q).join(', ')} FROM ${q(table)}
+       WHERE ${q(def.cursor)} ${unix ? '>' : '>='} ?1 ORDER BY ${q(def.cursor)} LIMIT ?2`,
+    )
+      .bind(unix ? since : sinceDate, PAGE)
+      .all<Record<string, string | number | null>>()
+
+    let rows = results
+    // unix 游标是严格大于，满页时末尾同一秒的一组可能被 LIMIT 从中间切断，
+    // 客户端用 next 续拉就会跳过它 —— 整组丢掉让下一页重取。
+    // 整页都是同一秒时不裁，否则就空转了。date 游标是 >=，不存在这个问题。
+    if (unix && rows.length === PAGE) {
+      const last = rows[rows.length - 1][def.cursor]
+      const trimmed = rows.filter((r) => r[def.cursor] !== last)
+      if (trimmed.length > 0) rows = trimmed
+    }
+    out[table] = rows
+
+    for (const r of rows) {
+      const v = r[def.cursor]
+      if (unix) nextSince = Math.max(nextSince, v as number)
+      else nextDate = (v as string) > nextDate ? (v as string) : nextDate
+    }
+  }
+
+  // 没有新行时原样回传请求的游标，客户端无脑存下来即可
+  return Response.json({ ...out, next: { since: nextSince, since_date: nextDate } })
+}
+
 // 阶段 0 的出口探测保留下来：下一块要从 Worker 验证 finance.yahoo.co.jp 的可达性，
 // 改 TARGETS 即可，不用再搭一遍。
 const PROBE_TARGETS: { name: string; url: string; headers?: Record<string, string> }[] = [
@@ -396,6 +605,17 @@ export default {
     if (url.pathname === '/sync/bars') {
       if (req.method === 'POST') return postBars(req, env)
       if (req.method === 'GET') return getBars(url, env)
+      return bad('只支持 GET / POST', 405)
+    }
+    if (url.pathname === '/sync/watchlist' || url.pathname === '/sync/settings') {
+      const table = url.pathname.slice('/sync/'.length)
+      if (req.method === 'GET') return getFullTable(table, env)
+      if (req.method === 'PUT') return putFullTable(table, req, env)
+      return bad('只支持 GET / PUT', 405)
+    }
+    if (url.pathname === '/sync/sectors') {
+      if (req.method === 'POST') return postSectors(req, env)
+      if (req.method === 'GET') return getSectors(url, env)
       return bad('只支持 GET / POST', 405)
     }
     if (url.pathname === '/probe') return probe(req)
