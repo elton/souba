@@ -1,3 +1,4 @@
+mod ai;
 mod core;
 mod settings;
 mod scan;
@@ -23,7 +24,8 @@ use crate::loader::BarKey;
 use crate::source::QuoteSource;
 use crate::source::tencent::TencentSource;
 use crate::store::Store;
-use crate::ui::detail::{BarState, DetailView};
+use crate::core::strategy::Signal;
+use crate::ui::detail::{AiState, BarState, DetailView};
 use crate::ui::surface::{Backend, Surface};
 use crate::ui::layout::{Breakpoint, MIN_HEIGHT, MIN_WIDTH, split};
 use crate::ui::watchlist::{ColumnKey, columns_for, freshness_label, truncate_display};
@@ -34,6 +36,14 @@ const REFRESH: Duration = Duration::from_secs(3);
 /// 一次拉多少根历史。EMA576 要 1330 根才收敛，日线给足；
 /// 分钟线源本身也给不了这么多，多要无害。
 const HISTORY_BARS: usize = 1500;
+
+/// 一次 AI 解读请求。喂给模型的是算好的 `Signal`，不是原始 K 线。
+struct AiJob {
+    symbol: Symbol,
+    signal: Signal,
+    /// 绕过当天的缓存重问
+    force: bool,
+}
 
 /// 把命令行给的代码解析成 Symbol。
 ///
@@ -128,7 +138,46 @@ async fn main() -> anyhow::Result<()> {
     // 的 EnableMouseCapture，见 kitty::MOUSE_ON 的注释。
     let mouse_ok = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_ON).is_ok();
     let mut app = App::new();
-    app.vegas = settings::Settings::load(&store)?.vegas;
+    let cfg = settings::Settings::load(&store)?;
+    app.vegas = cfg.vegas;
+
+    // AI：按需解读，沿用 K 线那套「请求走 mpsc、结果走 mpsc」
+    let (ai_tx, mut ai_rx) = tokio::sync::mpsc::channel::<AiJob>(4);
+    let (ai_res_tx, mut ai_res_rx) = tokio::sync::mpsc::channel::<(Symbol, AiState)>(8);
+    let ai_store = Arc::clone(&store);
+    let ai_model = cfg.ai_model.clone();
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .user_agent("souba/0.1")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[souba] AI 客户端初始化失败：{e}");
+                return;
+            }
+        };
+        while let Some(job) = ai_rx.recv().await {
+            // 每次都重读端点配置 —— 中途补上 .env 里的 key 不该需要重启
+            let ep = ai::Endpoint::from_env(&ai_model).ok();
+            let state = match ai::interpret(
+                &ai_store,
+                &job.symbol,
+                &job.signal,
+                ep,
+                job.force,
+                chrono::Utc::now().date_naive(),
+                |ep, body| ai::post(&client, ep, body),
+            )
+            .await
+            {
+                Ok(text) => AiState::Ready(text),
+                Err(e) => AiState::Failed(e.to_string()),
+            };
+            let _ = ai_res_tx.send((job.symbol, state)).await;
+        }
+    });
     if let Some(d) = &direct {
         app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
         app.screen = Screen::Detail;
@@ -141,6 +190,8 @@ async fn main() -> anyhow::Result<()> {
         &mut qrx,
         &req_tx,
         &mut bar_rx,
+        &ai_tx,
+        &mut ai_res_rx,
         backend,
     )
     .await;
@@ -155,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+// 参数就是几组后台通道，捆成一个结构体只是换个地方写同样的字段
+#[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -162,15 +215,19 @@ async fn run(
     qrx: &mut tokio::sync::watch::Receiver<Vec<Quote>>,
     req_tx: &tokio::sync::mpsc::Sender<BarKey>,
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
+    ai_tx: &tokio::sync::mpsc::Sender<AiJob>,
+    ai_res_rx: &mut tokio::sync::mpsc::Receiver<(Symbol, AiState)>,
     backend: Backend,
 ) -> anyhow::Result<()> {
     // 十字光标随鼠标动，所以鼠标位置也要纳入重绘判定 —— 否则位图不会刷新
+    // AI 文本区开着时这一帧不画 K 线，所以它也得进 stamp —— 否则残留的位图
+    // 会盖在解读文字上（位图在字符层之上，不清就一直在）
     type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind,
-                  crate::ui::viewport::Viewport, (u16, u16), usize);
+                  crate::ui::viewport::Viewport, (u16, u16), usize, bool);
     let mut last_stamp: Stamp = (Screen::Watchlist, usize::MAX, Timeframe::Day,
                                  crate::ui::detail::IndicatorKind::Macd,
                                  crate::ui::viewport::Viewport { span: 0, offset: usize::MAX },
-                                 (0, 0), usize::MAX);
+                                 (0, 0), usize::MAX, false);
     while !app.should_quit {
         if app.bars_dirty {
             app.bars_dirty = false;
@@ -183,6 +240,46 @@ async fn run(
         let quotes = qrx.borrow().clone();
         let (bar_key, bar_state) = bar_rx.borrow().clone();
 
+        // 结果先收，再派发本轮的请求
+        while let Ok((sym, state)) = ai_res_rx.try_recv() {
+            // 用户已经翻到别的标的了，就别拿旧标的的解读盖上去
+            if watch.get(app.selected) == Some(&sym)
+                && let Some(pane) = &mut app.ai
+            {
+                pane.state = state;
+                pane.scroll = 0;
+            }
+        }
+        if let Some(force) = app.ai_request.take()
+            && let Some(sym) = watch.get(app.selected)
+        {
+            // 手上这份数据必须确实是这只标的、这个周期的，否则解读的是别人的信号
+            let fresh = bar_key.as_ref() == Some(&(sym.clone(), app.timeframe));
+            let quote = quotes.iter().find(|q| &q.symbol == sym);
+            let signal = fresh
+                .then(|| {
+                    ui::detail::day_signal(sym, quote, app.timeframe, &bar_state, app.vegas)
+                })
+                .flatten();
+            match signal {
+                Some(signal) => {
+                    let job = AiJob { symbol: sym.clone(), signal, force };
+                    if ai_tx.try_send(job).is_err()
+                        && let Some(pane) = &mut app.ai
+                    {
+                        pane.state = AiState::Failed("上一次解读还没回来，稍后再按".into());
+                    }
+                }
+                None => {
+                    if let Some(pane) = &mut app.ai {
+                        pane.state = AiState::Failed(
+                            "还没有可解读的信号 —— 策略只在日线上求值，先切回日线等 K 线加载完".into(),
+                        );
+                    }
+                }
+            }
+        }
+
         // 先算 stamp 再决定要不要画位图 —— 之前是画完才发现没变然后扔掉，
         // 白白付出一张 400 万像素画布的分配与绘制开销。鼠标移动时这是主要瓶颈。
         let stamp = (
@@ -193,6 +290,7 @@ async fn run(
             app.viewport,
             terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
             bar_len(&bar_state),
+            app.ai.is_some(),
         );
         let bitmap_unchanged = stamp == last_stamp;
         let mut surface = Surface::with_skip(backend, bitmap_unchanged);
@@ -263,6 +361,7 @@ fn draw(
     bar_state: &BarState,
     surface: &mut Surface,
 ) {
+    let ai = app.ai.as_ref();
     let area = frame.area();
     let bp = Breakpoint::of(area);
     if bp == Breakpoint::TooSmall {
@@ -315,15 +414,18 @@ fn draw(
                         surface_label: surface.backend.label(),
                         mouse: app.mouse,
                         vegas: app.vegas,
+                        ai,
                     },
                     surface,
                 );
             }
+            let hint = if ai.is_some() {
+                " ↑↓/jk PgUp/PgDn 滚动   Home/End 首尾   R 重新解读   Esc 关闭解读"
+            } else {
+                " ←→ 滚动   =- 缩放/滚轮   鼠标悬停读数   Tab 切周期   ↑↓ 切标的   i 切指标   ? AI 解读   Esc 返回"
+            };
             frame.render_widget(
-                Paragraph::new(
-                    " ←→ 滚动   =- 缩放/滚轮   鼠标悬停读数   Tab 切周期   ↑↓ 切标的   i 切指标   Esc 返回",
-                )
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
                 panes.footer,
             );
         }
@@ -646,6 +748,51 @@ mod detail_render_tests {
         app.indicator = crate::ui::detail::IndicatorKind::Kdj;
         let t = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(120))), 140, 40);
         assert!(t.contains("KDJ"), "指标名没跟着切换");
+    }
+
+    #[test]
+    fn 解读文本区盖住k线并换掉底栏提示() {
+        let mut app = detail_app();
+        let 关着 = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(200))), 140, 40);
+        assert!(关着.contains("? AI 解读"), "底栏要告诉用户按哪个键：{关着}");
+
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(
+                "机器生成的策略分析，不构成投资建议\n\n慢隧道向上倾斜。".into(),
+            ),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        let 开着 = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(200))), 140, 40);
+        assert!(开着.contains("AI 解读"), "{开着}");
+        assert!(开着.contains("不构成投资建议"), "免责声明必须在屏幕上：{开着}");
+        assert!(开着.contains("Esc 关闭解读"), "底栏要换成文本区的键位：{开着}");
+        assert!(!开着.contains("MACD"), "文本区开着时不该还画指标面板");
+    }
+
+    #[test]
+    fn 解读打开时详情屏每行宽度仍等于终端宽度() {
+        let mut app = detail_app();
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(
+                "机器生成的策略分析，不构成投资建议。慢隧道向上倾斜，EMA12 站上快隧道上沿。".repeat(8),
+            ),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        for (w, h) in [(40u16, 24u16), (80, 24), (140, 40), (240, 70)] {
+            let buf = render_with(w, h, &app, &BarState::Ready(fake_bars(200)));
+            for y in 0..h {
+                let mut width = 0usize;
+                let mut x = 0u16;
+                while x < w {
+                    let sw = unicode_width::UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1);
+                    width += sw;
+                    x += sw as u16;
+                }
+                assert_eq!(width, w as usize, "{w}x{h} 第 {y} 行宽度 {width} != {w}");
+            }
+        }
     }
 
     #[test]

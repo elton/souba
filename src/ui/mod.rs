@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::core::strategy::vegas::VegasParams;
 use crate::core::bar::Timeframe;
-use crate::ui::detail::IndicatorKind;
+use crate::ui::detail::{AiPane, AiState, IndicatorKind};
 use crate::ui::viewport::Viewport;
 
 /// 界面当前停在哪一屏
@@ -37,6 +37,10 @@ pub struct App {
     pub bars_dirty: bool,
     /// 启动时从 settings 表装载；`souba set` 改了要重启才生效
     pub vegas: VegasParams,
+    /// AI 解读文本区。`Some` 表示它开着，此时详情屏的按键全归它。
+    pub ai: Option<AiPane>,
+    /// 用户按了 `?` 或 `R`，主循环据此发一次解读请求。`true` = 绕过缓存重问。
+    pub ai_request: Option<bool>,
 }
 
 impl App {
@@ -51,6 +55,8 @@ impl App {
             mouse: None,
             bars_dirty: false,
             vegas: VegasParams::default(),
+            ai: None,
+            ai_request: None,
         }
     }
 
@@ -93,7 +99,36 @@ impl App {
         }
     }
 
+    /// 文本区开着时它吃掉所有按键。让 Tab 在这时候还能切周期只会让人搞不清
+    /// 屏幕上那段解读到底在说哪一份数据。
+    fn on_key_ai(&mut self, key: KeyEvent) {
+        const PAGE: usize = 10;
+        let Some(pane) = &mut self.ai else { return };
+        let max = pane.max_scroll.get();
+        match key.code {
+            // Esc 回到详情屏而不是列表 —— 关一个浮层不该顺手退两层
+            KeyCode::Esc | KeyCode::Char('q') => self.ai = None,
+            KeyCode::Up | KeyCode::Char('k') => pane.scroll = pane.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => pane.scroll = (pane.scroll + 1).min(max),
+            KeyCode::PageUp => pane.scroll = pane.scroll.saturating_sub(PAGE),
+            KeyCode::PageDown => pane.scroll = (pane.scroll + PAGE).min(max),
+            KeyCode::Home => pane.scroll = 0,
+            KeyCode::End => pane.scroll = max,
+            // 大写 R 重问，避免跟别处的刷新语义打架
+            KeyCode::Char('R') => {
+                pane.scroll = 0;
+                pane.state = AiState::Loading;
+                self.ai_request = Some(true);
+            }
+            _ => {}
+        }
+    }
+
     fn on_key_detail(&mut self, key: KeyEvent, row_count: usize, bar_count: usize) {
+        if self.ai.is_some() {
+            self.on_key_ai(key);
+            return;
+        }
         match key.code {
             // 详情里 q 和 Esc 都是返回列表，不是退出程序 ——
             // 在子屏按 q 直接杀掉程序是很讨厌的行为
@@ -123,6 +158,16 @@ impl App {
                 self.bars_dirty = true;
             }
             KeyCode::Char('i') => self.indicator = self.indicator.next(),
+
+            // ? 让 AI 解读这一只的 Signal，R 强制重问。i 已经是切指标了。
+            KeyCode::Char('?') => {
+                self.ai = Some(AiPane::loading());
+                self.ai_request = Some(false);
+            }
+            KeyCode::Char('R') => {
+                self.ai = Some(AiPane::loading());
+                self.ai_request = Some(true);
+            }
 
             // 详情里上下切标的，不用退回列表
             KeyCode::Down | KeyCode::Char('j') if self.selected + 1 < row_count => {
@@ -374,6 +419,95 @@ mod nav_tests {
         app.on_key(press(KeyCode::Up), 3);
         assert_eq!(app.selected, 0);
         assert!(!app.bars_dirty, "到顶了不该再触发拉取");
+    }
+
+    #[test]
+    fn 问号键打开ai文本区并发起一次解读() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Enter), 3);
+        app.bars_dirty = false;
+        app.on_key(press(KeyCode::Char('?')), 3);
+        assert!(app.ai.is_some(), "? 应打开 AI 文本区");
+        assert_eq!(app.ai_request, Some(false), "首次按不该绕过缓存");
+        assert!(!app.bars_dirty, "解读不该触发重新拉 K 线");
+    }
+
+    #[test]
+    fn 大写r强制重问且不与刷新冲突() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Enter), 3);
+        app.on_key(press(KeyCode::Char('?')), 3);
+        app.ai_request = None;
+        if let Some(p) = &mut app.ai {
+            p.state = AiState::Ready("旧回答".into());
+            p.scroll = 7;
+        }
+        app.on_key(press(KeyCode::Char('R')), 3);
+        assert_eq!(app.ai_request, Some(true), "R 要绕过缓存");
+        let p = app.ai.as_ref().unwrap();
+        assert_eq!(p.scroll, 0, "重问要从头看");
+        assert!(matches!(p.state, AiState::Loading));
+    }
+
+    #[test]
+    fn 文本区里按esc回详情屏而不是退回列表() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Enter), 3);
+        app.on_key(press(KeyCode::Char('?')), 3);
+        app.on_key(press(KeyCode::Esc), 3);
+        assert!(app.ai.is_none(), "Esc 应关掉文本区");
+        assert_eq!(app.screen, Screen::Detail, "关浮层不该顺手退两层");
+        // 再按一次才回列表
+        app.on_key(press(KeyCode::Esc), 3);
+        assert_eq!(app.screen, Screen::Watchlist);
+    }
+
+    #[test]
+    fn 文本区开着时其余按键不穿透() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Enter), 3);
+        app.on_key(press(KeyCode::Char('?')), 3);
+        let (tf, ind, sel) = (app.timeframe, app.indicator, app.selected);
+        for k in [KeyCode::Tab, KeyCode::Char('i'), KeyCode::Char('=')] {
+            app.on_key_with(press(k), 3, 1000);
+        }
+        assert_eq!(app.timeframe, tf, "解读开着时切周期会让人搞不清解读的是哪份数据");
+        assert_eq!(app.indicator, ind);
+        assert_eq!(app.selected, sel);
+        assert!(app.ai.is_some());
+    }
+
+    #[test]
+    fn 文本区滚动被上限夹紧() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Enter), 3);
+        app.on_key(press(KeyCode::Char('?')), 3);
+        // 渲染会回填这个上限，这里直接模拟
+        app.ai.as_ref().unwrap().max_scroll.set(3);
+
+        for _ in 0..10 {
+            app.on_key(press(KeyCode::Down), 3);
+        }
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 3, "滚到底就不该再往下跑");
+        for _ in 0..10 {
+            app.on_key(press(KeyCode::Up), 3);
+        }
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 0, "滚到顶不该越界");
+
+        app.on_key(press(KeyCode::End), 3);
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 3);
+        app.on_key(press(KeyCode::PageUp), 3);
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 0);
+        app.on_key(press(KeyCode::PageDown), 3);
+        assert_eq!(app.ai.as_ref().unwrap().scroll, 3);
+    }
+
+    #[test]
+    fn 列表屏按问号不打开文本区() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Char('?')), 3);
+        assert!(app.ai.is_none(), "列表屏还没有选中标的的 Signal 可解读");
+        assert_eq!(app.ai_request, None);
     }
 
     #[test]

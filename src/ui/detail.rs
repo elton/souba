@@ -10,7 +10,7 @@ use crate::core::bar::{Bar, Timeframe};
 use crate::core::indicator::{Kdj, Macd, kdj, macd};
 use crate::core::quote::Quote;
 use crate::core::strategy::vegas::{Vegas, VegasParams};
-use crate::core::strategy::{FacetState, MarketData, Stance, Strategy};
+use crate::core::strategy::{FacetState, MarketData, Signal, Stance, Strategy};
 use crate::core::symbol::Symbol;
 use crate::ui::paint;
 use crate::ui::surface::Surface;
@@ -52,6 +52,34 @@ pub enum BarState {
     Failed(String),
 }
 
+/// AI 解读文本区的状态。和 K 线一样，「加载中」「失败」必须分得开。
+#[derive(Debug, Clone)]
+pub enum AiState {
+    Loading,
+    Ready(String),
+    Failed(String),
+}
+
+/// 详情屏上的 AI 解读文本区。`Some` 即表示它开着。
+#[derive(Debug)]
+pub struct AiPane {
+    pub state: AiState,
+    pub scroll: usize,
+    /// 渲染时回填的滚动上限。折行要到渲染时才知道面板有多宽，
+    /// 而按键处理拿不到宽度 —— 用一个 Cell 把上限带回去，比给 on_key 加参数省事。
+    pub max_scroll: std::cell::Cell<usize>,
+}
+
+impl AiPane {
+    pub fn loading() -> Self {
+        Self {
+            state: AiState::Loading,
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        }
+    }
+}
+
 pub struct DetailView<'a> {
     pub symbol: &'a Symbol,
     pub quote: Option<&'a Quote>,
@@ -65,6 +93,8 @@ pub struct DetailView<'a> {
     pub mouse: Option<(u16, u16)>,
     /// 信号行用的 Vegas 参数（来自 settings 表）
     pub vegas: VegasParams,
+    /// AI 解读文本区。`Some` 时它盖住 K 线与指标面板。
+    pub ai: Option<&'a AiPane>,
 }
 
 /// 鼠标停在哪个面板上
@@ -143,6 +173,12 @@ pub fn render(frame: &mut Frame, area: Rect, v: &DetailView, surface: &mut Surfa
     render_head(frame, head, v);
     // 信号行先画 —— 没有 K 线时下面会提前返回，而「数据不足」恰恰是那时最该说的话
     render_signal(frame, sig_area, v);
+
+    // 文本区开着就盖住图区。图和解读并排会把两边都挤成没法看。
+    if let Some(pane) = v.ai {
+        render_ai(frame, chart_area.union(ind_area), pane);
+        return;
+    }
 
     let bars = match v.bars {
         BarState::Ready(b) if !b.is_empty() => b,
@@ -427,6 +463,99 @@ fn render_price_axis(frame: &mut Frame, area: Rect, scale: paint::VScale) {
     }
 }
 
+/// 按**显示格**折行。CJK 一个字占两格，按字符数折会把右边框撑破。
+/// 换行符照原样断行，模型分段的地方就该分段。
+///
+/// 唯一的例外：面板只剩 1 格宽时全角字放不下，仍然单独成行（由渲染层裁掉），
+/// 宁可少显示半个字也不静默吞掉内容。
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        let mut w = 0usize;
+        for ch in para.trim_end_matches('\r').chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width && !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+                w = 0;
+            }
+            line.push(ch);
+            w += cw;
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// AI 解读文本区。**失败一律显示「AI 不可用：原因」** —— 跟行情源挂了一个待遇，
+/// 不静默、不装作没问过。
+fn render_ai(frame: &mut Frame, area: Rect, pane: &AiPane) {
+    if area.width == 0 || area.height == 0 {
+        pane.max_scroll.set(0);
+        return;
+    }
+    let (text, style) = match &pane.state {
+        AiState::Loading => (
+            "正在解读…".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
+        AiState::Ready(t) => (t.clone(), Style::default()),
+        AiState::Failed(why) => (
+            format!("AI 不可用：{why}"),
+            Style::default().fg(Color::Red),
+        ),
+    };
+
+    // 先探出内框宽度再折行 —— 标题要写「第几行/共几行」，得先知道折了几行
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let lines = wrap(&text, inner.width as usize);
+    let page = inner.height as usize;
+    let max = lines.len().saturating_sub(page);
+    pane.max_scroll.set(max);
+    let from = pane.scroll.min(max);
+
+    let title = if max > 0 {
+        format!(" AI 解读 · {}-{} / 共 {} 行 ", from + 1, (from + page).min(lines.len()), lines.len())
+    } else {
+        " AI 解读 ".to_string()
+    };
+    frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let shown: Vec<Line> = lines[from..]
+        .iter()
+        .take(page)
+        .map(|l| Line::from(Span::styled(l.clone(), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// 在日线上跑一次 Vegas。信号行与 AI 解读读的是同一份结果 ——
+/// 让 AI 解释一份跟屏幕上不一样的信号是最糟的 bug。
+///
+/// 周期不是日线、或者日线还没到，返回 `None`：不能拿日线的结论顶到周线那一栏上去，
+/// 那和把延迟报价显示成实时是同一类谎。
+pub fn day_signal(
+    symbol: &Symbol,
+    quote: Option<&Quote>,
+    tf: Timeframe,
+    bars: &BarState,
+    params: VegasParams,
+) -> Option<Signal> {
+    let day_bars = match (tf, bars) {
+        (Timeframe::Day, BarState::Ready(b)) if !b.is_empty() => b,
+        _ => return None,
+    };
+    let mut loaded = std::collections::HashMap::new();
+    loaded.insert(Timeframe::Day, day_bars.clone());
+    Some(Vegas { params }.evaluate(&MarketData::new(symbol, quote, &loaded)))
+}
+
 /// 策略信号行：主判定 + 五个维度的状态缩写。
 ///
 /// 现在详情屏的日线来自腾讯，最多 640 根，`EMA576` 的种子残留还有 5% 以上 ——
@@ -439,24 +568,15 @@ fn render_signal(frame: &mut Frame, area: Rect, v: &DetailView) {
     let gray = Style::default().fg(Color::DarkGray);
     let strategy = Vegas { params: v.vegas };
 
-    // Vegas 在日线上求值。切到周线/分钟线时不能拿日线的结论顶上去 ——
-    // 那和把延迟报价显示成实时是同一类谎。
-    let day_bars = match (v.timeframe, v.bars) {
-        (Timeframe::Day, BarState::Ready(b)) if !b.is_empty() => b,
-        _ => {
-            let msg = if v.timeframe == Timeframe::Day {
-                format!(" {} · 等待日线数据 ", strategy.name())
-            } else {
-                format!(" {} · 仅在日线上求值 ", strategy.name())
-            };
-            frame.render_widget(Paragraph::new(Span::styled(msg, gray)), area);
-            return;
-        }
+    let Some(sig) = day_signal(v.symbol, v.quote, v.timeframe, v.bars, v.vegas) else {
+        let msg = if v.timeframe == Timeframe::Day {
+            format!(" {} · 等待日线数据 ", strategy.name())
+        } else {
+            format!(" {} · 仅在日线上求值 ", strategy.name())
+        };
+        frame.render_widget(Paragraph::new(Span::styled(msg, gray)), area);
+        return;
     };
-
-    let mut loaded = std::collections::HashMap::new();
-    loaded.insert(Timeframe::Day, day_bars.clone());
-    let sig = strategy.evaluate(&MarketData::new(v.symbol, v.quote, &loaded));
 
     let stance_color = match sig.stance {
         Stance::Long => Color::Red,
@@ -596,6 +716,162 @@ mod tests {
 }
 
 #[cfg(test)]
+mod wrap_tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn 每行都不超过给定的显示格数() {
+        let text = "机器生成的策略分析，不构成投资建议。慢隧道向上倾斜，EMA12 已经站上快隧道上沿。";
+        for w in [1usize, 2, 3, 7, 20, 41, 200] {
+            for line in wrap(text, w) {
+                // 1 格宽时一个全角字都放不下，只能让它单独成行交给渲染层裁
+                assert!(
+                    line.width() <= w.max(2),
+                    "宽度 {w} 下折出了 {} 格的行：{line:?}",
+                    line.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cjk按两格算而不是一个字符() {
+        // 按字符数折的话「中文测试」四个字会挤进 4 格，实际要 8 格
+        assert_eq!(wrap("中文测试", 4), vec!["中文", "测试"]);
+        assert_eq!(wrap("中文测试", 8), vec!["中文测试"]);
+    }
+
+    #[test]
+    fn 宽字符不会被劈成半格() {
+        // 奇数宽度下最后一格放不下一个全角字，只能留空
+        let lines = wrap("中文测试", 5);
+        for l in &lines {
+            assert!(l.width() <= 5, "{l:?}");
+        }
+        assert_eq!(lines.concat(), "中文测试", "折行不能吞字也不能加字");
+    }
+
+    #[test]
+    fn 换行符照原样断行() {
+        assert_eq!(wrap("甲\n乙", 10), vec!["甲", "乙"]);
+        // 空段落保留成空行 —— 模型用空行分段，吞掉就糊成一坨
+        assert_eq!(wrap("甲\n\n乙", 10), vec!["甲", "", "乙"]);
+    }
+
+    #[test]
+    fn 宽度为零时不死循环也不panic() {
+        assert!(wrap("中文", 0).is_empty());
+    }
+
+    #[test]
+    fn 折行不丢字() {
+        let text = "机器生成的策略分析，不构成投资建议";
+        assert_eq!(wrap(text, 6).concat(), text);
+    }
+}
+
+#[cfg(test)]
+mod ai_pane_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use unicode_width::UnicodeWidthStr;
+
+    fn draw(w: u16, h: u16, pane: &AiPane) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_ai(f, Rect::new(0, 0, w, h), pane)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn text(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> String {
+        (0..h)
+            .map(|y| {
+                let mut out = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let s = buf[(x, y)].symbol();
+                    out.push_str(s);
+                    x += UnicodeWidthStr::width(s).max(1) as u16;
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn pane(state: AiState) -> AiPane {
+        AiPane { state, scroll: 0, max_scroll: std::cell::Cell::new(0) }
+    }
+
+    #[test]
+    fn 加载中与失败与回答三种文案互不相同() {
+        let l = text(&draw(60, 10, &pane(AiState::Loading)), 60, 10);
+        let f = text(&draw(60, 10, &pane(AiState::Failed("未配置 LLM_API_KEY".into()))), 60, 10);
+        let r = text(&draw(60, 10, &pane(AiState::Ready("慢隧道向上。".into()))), 60, 10);
+        assert!(l.contains("正在解读"), "{l}");
+        assert!(f.contains("AI 不可用：未配置 LLM_API_KEY"), "失败要说清原因：{f}");
+        assert!(r.contains("慢隧道向上。"), "{r}");
+        assert_ne!(l, f);
+        assert_ne!(f, r);
+    }
+
+    #[test]
+    fn 各尺寸都不panic且每行宽度等于面板宽() {
+        let long = "机器生成的策略分析，不构成投资建议\n\n".to_string()
+            + &"慢隧道向上倾斜，EMA12 站上快隧道上沿，位置维度近 5 根有 4 根在隧道上方。".repeat(6);
+        for (w, h) in [(1u16, 1u16), (2, 2), (3, 3), (20, 5), (60, 12), (140, 40), (240, 70)] {
+            let p = pane(AiState::Ready(long.clone()));
+            let buf = draw(w, h, &p);
+            for y in 0..h {
+                let mut width = 0usize;
+                let mut x = 0u16;
+                while x < w {
+                    let sw = UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1);
+                    width += sw;
+                    x += sw as u16;
+                }
+                assert_eq!(width, w as usize, "{w}x{h} 第 {y} 行宽度 {width} != {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn 内容超出一屏时回填滚动上限否则为零() {
+        let 短 = pane(AiState::Ready("一行".into()));
+        draw(60, 12, &短);
+        assert_eq!(短.max_scroll.get(), 0, "装得下就不该允许滚动");
+
+        let 长 = pane(AiState::Ready((0..50).map(|i| format!("第 {i} 行")).collect::<Vec<_>>().join("\n")));
+        draw(60, 12, &长);
+        assert!(长.max_scroll.get() > 0, "装不下要报出滚动上限");
+    }
+
+    #[test]
+    fn 滚动之后显示的是后面的行() {
+        let body = (0..50).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
+        let mut p = pane(AiState::Ready(body.clone()));
+        let 顶部 = text(&draw(60, 12, &p), 60, 12);
+        p.scroll = 20;
+        let 中段 = text(&draw(60, 12, &p), 60, 12);
+        assert!(顶部.contains("第0行") && !顶部.contains("第20行"));
+        assert!(中段.contains("第20行") && !中段.contains("第0行"));
+
+        // 滚过头只到底，不会渲染出空白页
+        p.scroll = usize::MAX;
+        let 底部 = text(&draw(60, 12, &p), 60, 12);
+        assert!(底部.contains("第49行"), "{底部}");
+    }
+
+    #[test]
+    fn 可滚动时标题写明位置() {
+        let body = (0..50).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
+        let t = text(&draw(60, 12, &pane(AiState::Ready(body))), 60, 12);
+        assert!(t.contains("共 50 行"), "标题要让人知道还有多少没看：{t}");
+    }
+}
+
+#[cfg(test)]
 mod axis_tests {
     use super::*;
     use crate::core::bar::Bar;
@@ -677,6 +953,7 @@ mod axis_tests {
                     surface_label: backend.label(),
                     mouse: None,
                     vegas: VegasParams::default(),
+                    ai: None,
                 },
                 &mut surface,
             )
@@ -919,6 +1196,7 @@ mod axis_tests {
                     surface_label: "盲文",
                     mouse: None,
                     vegas: VegasParams::default(),
+                    ai: None,
                 },
                 &mut surface,
             )
@@ -1102,6 +1380,7 @@ mod hover_tests {
                     surface_label: "盲文",
                     mouse,
                     vegas: VegasParams::default(),
+                    ai: None,
                 },
                 &mut surface,
             )
