@@ -1,17 +1,7 @@
 //! 策略与扫描参数：键定义、默认值、校验、从库装载，以及 set/get/settings 三个子命令。
 
+pub use crate::core::strategy::vegas::VegasParams;
 use crate::store::Store;
-
-/// Vegas 通道参数。默认值见 spec §策略与排序。
-#[derive(Debug, Clone, PartialEq)]
-pub struct VegasParams {
-    pub filter: usize,
-    pub fast: (usize, usize),
-    pub slow: (usize, usize),
-    pub min_bars: usize,
-    pub slope_window: usize,
-    pub fresh_window: usize,
-}
 
 /// 板块扫描参数。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,19 +20,6 @@ pub struct Settings {
     pub scan: ScanParams,
     /// 空表示用 `.env` 里的 `LLM_MODEL`
     pub ai_model: String,
-}
-
-impl Default for VegasParams {
-    fn default() -> Self {
-        Self {
-            filter: 12,
-            fast: (144, 169),
-            slow: (576, 676),
-            min_bars: 1330,
-            slope_window: 5,
-            fresh_window: 3,
-        }
-    }
 }
 
 impl Default for ScanParams {
@@ -127,8 +104,8 @@ impl Settings {
     pub fn apply(&mut self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "vegas.filter" => self.vegas.filter = as_usize(value)?,
-            "vegas.fast" => self.vegas.fast = as_pair(value)?,
-            "vegas.slow" => self.vegas.slow = as_pair(value)?,
+            "vegas.fast" => (self.vegas.fast_lo, self.vegas.fast_hi) = as_pair(value)?,
+            "vegas.slow" => (self.vegas.slow_lo, self.vegas.slow_hi) = as_pair(value)?,
             "vegas.min_bars" => self.vegas.min_bars = as_usize(value)?,
             "vegas.slope_window" => self.vegas.slope_window = as_usize(value)?,
             "vegas.fresh_window" => self.vegas.fresh_window = as_usize(value)?,
@@ -159,18 +136,18 @@ impl Settings {
                 return Err(format!("{name} 不能为 0"));
             }
         }
-        for (name, p) in [("vegas.fast", v.fast), ("vegas.slow", v.slow)] {
+        for (name, p) in [("vegas.fast", (v.fast_lo, v.fast_hi)), ("vegas.slow", (v.slow_lo, v.slow_hi))] {
             if p.0 == 0 || p.1 == 0 {
                 return Err(format!("{name} 的周期不能为 0（得到 {},{}）", p.0, p.1));
             }
         }
-        if v.fast.0.min(v.fast.1) >= v.slow.0.min(v.slow.1) {
+        if v.fast_lo.min(v.fast_hi) >= v.slow_lo.min(v.slow_hi) {
             return Err(format!(
                 "快隧道 {},{} 必须比慢隧道 {},{} 快（按各自较短的那条比）",
-                v.fast.0, v.fast.1, v.slow.0, v.slow.1
+                v.fast_lo, v.fast_hi, v.slow_lo, v.slow_hi
             ));
         }
-        let longest = v.slow.0.max(v.slow.1);
+        let longest = v.slow_lo.max(v.slow_hi);
         if v.min_bars < longest {
             return Err(format!(
                 "vegas.min_bars {} 小于慢隧道最长周期 {longest}，这么少的根数算不出 EMA",
@@ -195,8 +172,8 @@ impl Settings {
         let s = &self.scan;
         Some(match key {
             "vegas.filter" => v.filter.to_string(),
-            "vegas.fast" => format!("{},{}", v.fast.0, v.fast.1),
-            "vegas.slow" => format!("{},{}", v.slow.0, v.slow.1),
+            "vegas.fast" => format!("{},{}", v.fast_lo, v.fast_hi),
+            "vegas.slow" => format!("{},{}", v.slow_lo, v.slow_hi),
             "vegas.min_bars" => v.min_bars.to_string(),
             "vegas.slope_window" => v.slope_window.to_string(),
             "vegas.fresh_window" => v.fresh_window.to_string(),
@@ -251,7 +228,7 @@ pub fn run(cmd: &str, store: &Store, args: &[String]) -> anyhow::Result<()> {
             println!("{key} = {}（默认 {}）", shown(&cur, key), shown(&def, key));
         }
         "settings" => {
-            println!("{}{}{}", pad("键", 22), pad("当前值", 18), "默认值");
+            println!("{}{}默认值", pad("键", 22), pad("当前值", 18));
             for key in KEYS {
                 let now = shown(&cur, key);
                 let d = shown(&def, key);
@@ -276,8 +253,8 @@ mod tests {
     fn 默认值符合规格() {
         let s = Settings::default();
         assert_eq!(s.vegas.filter, 12);
-        assert_eq!(s.vegas.fast, (144, 169));
-        assert_eq!(s.vegas.slow, (576, 676));
+        assert_eq!((s.vegas.fast_lo, s.vegas.fast_hi), (144, 169));
+        assert_eq!((s.vegas.slow_lo, s.vegas.slow_hi), (576, 676));
         assert_eq!(s.vegas.min_bars, 1330);
         assert_eq!(s.vegas.slope_window, 5);
         assert_eq!(s.vegas.fresh_window, 3);
@@ -301,9 +278,9 @@ mod tests {
         let st = store();
         st.set_setting("vegas.fast", "89,144").unwrap();
         let s = Settings::load(&st).unwrap();
-        assert_eq!(s.vegas.fast, (89, 144));
+        assert_eq!((s.vegas.fast_lo, s.vegas.fast_hi), (89, 144));
         // 其余键仍取默认
-        assert_eq!(s.vegas.slow, (576, 676));
+        assert_eq!((s.vegas.slow_lo, s.vegas.slow_hi), (576, 676));
         assert_eq!(s.scan.k, 20);
     }
 
@@ -355,7 +332,7 @@ mod tests {
 
     #[test]
     fn 合法修改被接受() {
-        assert_eq!(set("vegas.fast", "89,144").unwrap().vegas.fast, (89, 144));
+        assert_eq!(set("vegas.fast", "89,144").unwrap().vegas.fast_lo, 89);
         assert_eq!(set("vegas.filter", " 21 ").unwrap().vegas.filter, 21);
         assert_eq!(set("scan.w_change", "0").unwrap().scan.w_change, 0.0);
         assert_eq!(set("scan.heat_days", "0").unwrap().scan.heat_days, 0);

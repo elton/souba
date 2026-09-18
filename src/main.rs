@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     // 的 EnableMouseCapture，见 kitty::MOUSE_ON 的注释。
     let mouse_ok = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_ON).is_ok();
     let mut app = App::new();
+    app.vegas = settings::Settings::load(&store)?.vegas;
     if let Some(d) = &direct {
         app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
         app.screen = Screen::Detail;
@@ -331,6 +332,7 @@ fn draw(
                         viewport: app.viewport,
                         surface_label: surface.backend.label(),
                         mouse: app.mouse,
+                        vegas: app.vegas,
                     },
                     surface,
                 );

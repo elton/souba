@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::core::bar::{Bar, Timeframe};
 use crate::core::indicator::{Kdj, Macd, kdj, macd};
 use crate::core::quote::Quote;
-use crate::core::strategy::vegas::Vegas;
+use crate::core::strategy::vegas::{Vegas, VegasParams};
 use crate::core::strategy::{FacetState, MarketData, Stance, Strategy};
 use crate::core::symbol::Symbol;
 use crate::ui::paint;
@@ -60,6 +60,8 @@ pub struct DetailView<'a> {
     pub surface_label: &'static str,
     /// 鼠标格子坐标，用来画十字光标
     pub mouse: Option<(u16, u16)>,
+    /// 信号行用的 Vegas 参数（来自 settings 表）
+    pub vegas: VegasParams,
 }
 
 /// 鼠标停在哪个面板上
@@ -432,7 +434,7 @@ fn render_signal(frame: &mut Frame, area: Rect, v: &DetailView) {
         return;
     }
     let gray = Style::default().fg(Color::DarkGray);
-    let strategy = Vegas::default();
+    let strategy = Vegas { params: v.vegas };
 
     // Vegas 在日线上求值。切到周线/分钟线时不能拿日线的结论顶上去 ——
     // 那和把延迟报价显示成实时是同一类谎。
@@ -656,6 +658,7 @@ mod axis_tests {
                     viewport: vp,
                     surface_label: backend.label(),
                     mouse: None,
+                    vegas: VegasParams::default(),
                 },
                 &mut surface,
             )
@@ -856,6 +859,7 @@ mod axis_tests {
                     viewport: Viewport::default(),
                     surface_label: "盲文",
                     mouse: None,
+                    vegas: VegasParams::default(),
                 },
                 &mut surface,
             )
@@ -1038,6 +1042,7 @@ mod hover_tests {
                     viewport: Viewport::default(),
                     surface_label: "盲文",
                     mouse,
+                    vegas: VegasParams::default(),
                 },
                 &mut surface,
             )

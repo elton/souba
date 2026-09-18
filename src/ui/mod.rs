@@ -11,6 +11,7 @@ pub mod watchlist;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::core::strategy::vegas::VegasParams;
 use crate::core::bar::Timeframe;
 use crate::ui::detail::IndicatorKind;
 use crate::ui::viewport::Viewport;
@@ -34,6 +35,8 @@ pub struct App {
     pub mouse: Option<(u16, u16)>,
     /// 用户改过周期/标的后置位，主循环据此重新拉历史
     pub bars_dirty: bool,
+    /// 启动时从 settings 表装载；`souba set` 改了要重启才生效
+    pub vegas: VegasParams,
 }
 
 impl App {
@@ -47,6 +50,7 @@ impl App {
             viewport: Viewport::default(),
             mouse: None,
             bars_dirty: false,
+            vegas: VegasParams::default(),
         }
     }
 
