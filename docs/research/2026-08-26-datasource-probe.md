@@ -1,7 +1,8 @@
 # 免费行情数据源实测报告
 
-**日期：** 2026-08-26
-**方法：** 从**中国大陆以外**的 IP（日本，JST）用 `curl` 直接调用各接口，盘中实测。
+**日期：** 2026-08-26（初版） · **2026-09-18**（板块与历史源补测）
+**方法：** 从**中国大陆以外**的 IP（日本 KDDI 住宅/移动线路，JST）用 `curl` 直接调用各接口，盘中实测。
+**两轮都不是从 Cloudflare Worker 出口打的** —— Worker 侧可达性另见 [`2026-08-26-worker-出口验证.md`](2026-08-26-worker-出口验证.md)。
 所有结论来自实际响应，不是文档或记忆。复现脚本：[`scripts/probe-datasources.sh`](../../scripts/probe-datasources.sh)。
 
 > 为什么要从海外 IP 测：后端计划跑在 Cloudflare Workers 上，出口是全球数据中心 IP。
@@ -10,6 +11,13 @@
 > **⚠️ 本文修订过一次。** 初版结论「港股只能拿到 15 分钟延迟」**是错的** —— 当时测的是延迟孪生接口。
 > 港股有免费真实时，见第 2 节。这个错误值得留在这里作为教训：**同一台主机上的两个接口，
 > 只差一个前缀，一个实时一个延迟。**
+
+> **📌 2026-09-18 二次查证。** 为「板块扫描 + 历史落库」这一块补测了板块分类源、复权因子和
+> 各市场历史源，推翻了初版的两条结论：**Alpaca 免费档的历史不是 IEX 子集**（第 4a 节）、
+> **日股历史有源**（第 4b 节）。新增第 3c 节（新浪返回原始价）与第 5 节（板块分类与成分股）。
+> **测试环境与初版相同：所有 `curl` 来自日本 KDDI 的住宅/移动 IP，不是 Cloudflare Worker 出口。**
+> Worker 侧可达性仍然只在阶段 0 对腾讯/新浪验证过，其余域名（尤其 `finance.yahoo.co.jp`、
+> `jpx.co.jp`、`alpaca.markets`）**一次都没从 Worker 打过**。
 
 ## 结论速览
 
@@ -28,12 +36,18 @@
 | A股 日K/周K | 腾讯 `web.ifzq.gtimg.cn` | ⚠️ 上限 640 根 |
 | 港股 日K | 腾讯 `web.ifzq.gtimg.cn` | ⚠️ 上限 640 根 |
 | 美股/日股 历史K线 | 腾讯 | ❌ 只返回 1–2 根 |
-| 美股 实时+历史 | Alpaca Basic（免费档） | 🟡 真实时但仅 IEX（约 2–3% 成交量），200 req/min |
-| 日股 深度历史 | J-Quants 免费档 | 🟡 官方免费，但**尾部缺 12 周**，且一年后自动取消 |
+| 美股 实时+历史 | Alpaca Basic（免费档） | ✅ 实时仅 IEX；**历史默认 SIP 全量**，日线回溯 2016 |
+| **日股 深度历史** | Yahoo 日本站 **history 页** | ✅ **服务端渲染表格，实测回溯到 2010** |
+| 日股 深度历史 | J-Quants 免费档 | 🟡 官方免费，但**滞后 12 周**、窗口约 1.77 年，一年后自动解约 |
+| A股 板块列表/成分 | 新浪 `newSinaHy.php` / `newFLJK.php` / `Market_Center.*` | ✅ 免费，**不需要 Referer** |
+| 美股 板块热度/成分 | 腾讯批量报价 11 只 SPDR ETF ＋ S&P 500 GICS CSV | ✅ 一次请求实测打通 |
+| 日股 板块分类 | JPX 官方 `data_j.xlsx`（33 業種） | ✅ 每月更新 |
+| 港股 行业分类 | 恒生 HSICS | ❌ 付费；退而用 Wikipedia 的 HSI/HSCEI 成分表 |
+| 任一市场 板块接口 | 腾讯 `q=bk…` | ❌ 返回 `v_pv_none_match`，腾讯没有板块接口 |
 | 全市场深历史 | 东方财富 `push2his` | ❌ HTTPS 连不通；HTTP 打几次即封 IP |
 | 全市场 | Yahoo Finance 国际站 | ❌ 429；`getcrumb` 返回 `Too Many Request` |
 | A股 全历史 CSV | 网易 `quotes.money.163.com` | ❌ 502（海外封禁） |
-| 美/日 历史 | Stooq | ❌ SHA-256 proof-of-work 验证墙 |
+| 美/日 历史 | Stooq | ❌ SHA-256 proof-of-work 验证墙（2026-09-18 复测仍在） |
 
 ## 1. 腾讯 `qt.gtimg.cn` —— 一个源覆盖四市场
 
@@ -168,19 +182,143 @@ jp7203    Toyota Motor Corp.  3088      2026-08-26 11:33:01  ← 日股 延迟 1
 **产品含义：整个自选股列表一次请求即可刷新**，不必按市场拆分，也不必逐只轮询。
 这同时大幅降低了触发 IP 封禁的风险。
 
+## 3c. 新浪日线返回的是原始价 —— 复权因子要另取（2026-09-18 实测）
+
+上一节的 `CN_MarketData.getKLineData` 给的是**未复权的原始价**，初版没写这件事。对照茅台除权前后：
+
+| 日期 | 新浪 `CN_MarketData` | 腾讯 qfq |
+|---|---|---|
+| 2024-06-14（除权前一日） | **1555.00** | **1420.66** |
+
+差的正是那次分红。前复权因子在另一个地址，是一个静态 JS 文件：
+
+```
+https://finance.sina.com.cn/realstock/company/sh600519/qfq.js
+```
+
+```js
+var sh600519qfq={"total":33,"data":[{"d":"2026-06-26","f":"1.0"},{"d":"2025-06-25","f":"..."}, ...]};
+```
+
+`data` 按**除权日倒序**排列，`f` 是**累计因子**：某个除权日之前的 bar 除以该日对应的因子即得前复权价。
+用这套因子复权后，与腾讯 qfq 的结果**差约 0.2%** —— 是两家复权算法的差异，不是解析错了。
+
+**产品含义：库里存原始价 + 一张因子表，读时复权。** 这样历史永远只增不改，
+每次分红也不必把整只标的重算落库。
+
 ## 4. 各市场历史数据方案
 
 | 市场 | 冷启动深度 | 来源 | 缺口 |
 |---|---|---|---|
 | A股 | **5990 根日线（25 年）** ✅ | 新浪 `money.finance.sina.com.cn` | 无 |
 | 港股 | 640 根日线 | 腾讯 `web.ifzq.gtimg.cn` | 距 1330 根差 690 根，需积累约 2.7 年 |
-| 美股 | 待定 | Alpaca Basic（免费，需注册） | 需实测其历史深度 |
-| 日股 | 约 490 根（2 年，尾部缺 12 周） | J-Quants 免费档 | 深度不足，且一年后账号自动取消 |
+| 美股 | **日线回溯 2016 年** ✅ | Alpaca Basic（免费档，邮箱注册即得） | 单次最多 10000 根，需分页 |
+| 日股 | **实测回溯 2010 年** ✅ | Yahoo 日本站 history 页（HTML 表格） | 20 行/页，需翻页；Worker 可达性未测 |
+| 日股（备选） | 约 490 根（约 1.77 年，滞后 12 周） | J-Quants 免费档 | 深度不足，且一年后自动解约 |
 
 **共同结论：历史 K 线必须由本项目自行落库并逐日累积。** 冷启动时能拿多少拿多少，之后每天追加。
 这直接决定了 Cloudflare 侧需要一个长期存放多市场多周期 OHLCV 的库，而不只是做缓存。
 
-## 5. 三个已排除的数据源
+### 4a. 美股历史：Alpaca 免费档（2026-09-18 更正）
+
+**初版把「实时仅 IEX、约 2–3% 成交量」的限制误套到了历史上。** 官方文档说的是：
+
+- **实时**（websocket / 最新报价）确实**只有 IEX**。
+- **历史**（15 分钟以前的数据）**不传 `feed=iex` 时默认就是 SIP 全量**，不是 IEX 子集。
+- 日线**回溯到 2016 年**；也支持 5 / 15 / 60 分钟线。
+- 速率 **200 请求/分钟**，单次最多 **10000 根**（超出用分页 token 续取）。
+- **邮箱注册即得，全球可用，不需要身份认证** —— 不必开美国券商账户。
+
+出处：`docs.alpaca.markets/us/docs/about-market-data-api`、
+`docs.alpaca.markets/us/reference/stockbars`、
+`forum.alpaca.markets/t/iex-feed-historical-data/13681`。
+
+### 4b. 日股历史：Yahoo 日本站的 history 页可以解析（2026-09-18 实测）
+
+**初版结论「日股历史无源」作废。** 注意区分同一站点的两个页面：
+
+- **报价页**（第 2b 节）确实是 Next.js 的 RSC flight 流，只能靠带构建哈希的 CSS 类名定位 ——
+  **那一节的结论仍然成立，不要删。**
+- **history 页是另一套东西**，服务端渲染的普通 HTML 表格：
+
+```
+https://finance.yahoo.co.jp/quote/7203.T/history?from=20100101&to=20101231
+```
+
+表格是 `<table id="histlist">`，列为**日付 / 始値 / 高値 / 安値 / 終値 / 出来高 / 調整後終値**，
+**20 行一页**；`?from=YYYYMMDD&to=YYYYMMDD` 可以直接跳到任意年份，**实测取到 2010 年**。
+
+两个注意事项：
+
+- `<td>` 的 class 一样带构建哈希，**只能靠 `id="histlist"` 定位**，绝不要写 class 选择器。
+- **Worker 出口对 `.co.jp` 的可达性未测。** 它和已经确认 429 的 Yahoo 国际站
+  **不是同一套 WAF**，不能拿国际站的结果推断 —— 下一块开工前必须从 Worker 实打一次。
+
+J-Quants 免费档的官方原文窗口是「**12 週間前〜2 年 12 週間前**」（约 1.77 年），即**滞后 12 周**；
+**一年后自动解约，但可以重新注册**，注册不需要信用卡。
+
+其余日股源都不可用：minkabu 返回 **403**；kabutan 的初始 HTML 里没有完整的日足表。
+
+## 5. 板块分类与成分股（2026-09-18 实测）
+
+四个市场没有任何一个统一的源，逐个查证的结果如下。**腾讯完全没有板块接口** ——
+`qt.gtimg.cn/q=bk…` 返回 `v_pv_none_match`。
+
+### A股：新浪的三个端点，**不需要 `Referer`**
+
+| 用途 | 接口 | 编码 |
+|---|---|---|
+| 行业列表 | `vip.stock.finance.sina.com.cn/q/view/newSinaHy.php` | **GBK 原始字节** |
+| 概念 / 地域 / 旧行业列表 | `money.finance.sina.com.cn/q/view/newFLJK.php?param=class`（`area` / `industry`） | **GBK 原始字节** |
+| 板块成分股 | `vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=100&sort=changepercent&asc=0&node={代码}` | JSON，中文是 `\uXXXX` 转义，**不是 GBK** |
+| 板块成分股总数 | `…/Market_Center.getHQNodeStockCount?node={代码}` | JSON |
+
+- 两个列表接口**一次吐全**，字段含板块代码、名称、成分数、涨幅、成交额。
+- 成分股接口**固定 100 条/页**，`sort=changepercent&asc=0` 即按涨幅降序。
+- **这几个板块端点不需要 `Referer`** —— 与第 3 节的日线接口不同，按端点分别处理，别一把套上。
+- 板块代码形如 `hangye_ZC27`、`gn_hwqc`、`new_blhy`，**没有官方文档**，只能从列表接口现取，不要硬编码。
+- 沪深300 / 中证500 成分股另有两条路：中证官方静态表
+  `oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/cons/000300cons.xls`（每日更新），
+  或新浪 `node=hs300` / `node=zhishu_000905`（改用 `getHQNodeDataSimple`，**不受 100 条限制**）。
+
+其余国内源都不可用：**同花顺**的板块成分股接口已从 AKShare 移除、历史 K 线还要跑 JS 算 cookie；
+**雪球**要登录 token；**通达信**是私有二进制协议。
+
+### 港股：没有免费的机器可读行业分类
+
+恒生官方的 **HSICS 分类是付费产品**；腾讯和新浪都没有港股板块接口；
+新浪那个港股板块页 **2011 年之后就没更新过**。
+
+能用的只有 Wikipedia 上的 **HSI（88 只）** 与 **HSCEI（50 只）** 成分表，
+带恒生的老 4 大类（Finance / Utilities / Properties / Commerce & Industry）。粒度粗，但免费且稳定。
+
+### 美股：板块热度用 ETF，成分股用 GICS CSV
+
+板块热度直接借腾讯的批量报价打 11 只 SPDR 板块 ETF，**一次请求实测打通**，带涨跌幅：
+
+```
+https://qt.gtimg.cn/q=usXLK,usXLF,usXLE,usXLV,usXLI,usXLY,usXLP,usXLU,usXLB,usXLRE,usXLC
+```
+
+成分股与分类用 S&P 500 的 GICS CSV：
+`raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv`
+—— **503 行**，含 GICS Sector 与 Sub-Industry。
+
+两个看着能替代、实际不能的：**Nasdaq screener** 的 `sector` 字段是 **ICB 不是 GICS**；
+**SEC EDGAR** 只有 **SIC**，同样没有 GICS。
+
+### 日股：JPX 官方 Excel
+
+```
+https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx
+```
+
+全市场名单，含 **33 業種**、**17 業種**和**規模**分类，托管在 S3 上，**每月更新**。
+
+**Nikkei 225 官网 `indexes.nikkei.co.jp` 对程序化访问返回 403**，拿不到成分表；
+池子改成按 33 業種各取成交额前若干只。
+
+## 6. 三个已排除的数据源
 
 ### 东方财富 `push2his.eastmoney.com` —— 会封 IP
 - HTTPS 握手完成后服务端直接断开（`curl` exit 52），IPv4/IPv6 均如此。
@@ -193,9 +331,9 @@ jp7203    Toyota Motor Corp.  3088      2026-08-26 11:33:01  ← 日股 延迟 1
 ### Yahoo Finance 国际站 / Stooq
 - Yahoo：`v8/finance/chart` 直接 429；cookie+crumb 流程里 `getcrumb` 返回字符串 `Too Many Request`。
   少量请求即触发。Workers 出口 IP 被众多用户共享，只会更早触发。
-- Stooq：返回 200 但 body 是要求计算 SHA-256 前导 4 个零的 JS 挑战页。
+- Stooq：返回 200 但 body 是要求计算 SHA-256 前导 4 个零的 JS 挑战页。**2026-09-18 复测，墙还在。**
 
-## 6. 所有免费源都会封 IP —— 这是架构约束
+## 7. 所有免费源都会封 IP —— 这是架构约束
 
 调研过程中**新浪和东财都因为我连续快速请求而临时封禁**。新浪在约 10 次快速请求后开始返回空，
 间隔 6–8 秒后恢复。东财则直接长时间拒绝。
