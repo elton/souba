@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::core::symbol::Symbol;
 
@@ -114,6 +114,26 @@ impl Store {
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, unixepoch())
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// AI 回答缓存。**只留在本地，不进 D1 同步** —— 丢了重问就是了，不值得占额度。
+    pub fn ai_cached(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        Ok(conn
+            .query_row("SELECT response FROM ai_cache WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn ai_cache_put(&self, key: &str, response: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        conn.execute(
+            "INSERT INTO ai_cache (key, response, created_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(key) DO UPDATE SET response = excluded.response, created_at = excluded.created_at",
+            rusqlite::params![key, response],
         )?;
         Ok(())
     }
@@ -394,5 +414,16 @@ CREATE TABLE IF NOT EXISTS bars (
             .query_row("SELECT COUNT(*) FROM bars", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "重跑迁移把 bars 清空了");
+    }
+
+    #[test]
+    fn ai缓存可写可读未命中返回none() {
+        let st = Store::open_in_memory().unwrap();
+        assert_eq!(st.ai_cached("没写过").unwrap(), None);
+        st.ai_cache_put("k1", "第一次的回答").unwrap();
+        assert_eq!(st.ai_cached("k1").unwrap().as_deref(), Some("第一次的回答"));
+        // 同键重写覆盖而不是报唯一约束
+        st.ai_cache_put("k1", "重问的回答").unwrap();
+        assert_eq!(st.ai_cached("k1").unwrap().as_deref(), Some("重问的回答"));
     }
 }
