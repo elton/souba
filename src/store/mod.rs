@@ -18,29 +18,25 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
-/// 与 Cloudflare D1 共用的 schema。bars 表阶段 1 还没用到，
-/// 但先建好 —— 阶段 4 要往里灌历史，届时不必迁移。
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS watchlist (
-  symbol     TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  sort_order INTEGER NOT NULL,
-  added_at   INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS bars (
-  symbol    TEXT NOT NULL,
-  timeframe TEXT NOT NULL,
-  ts        INTEGER NOT NULL,
-  open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
-  close REAL NOT NULL, volume REAL NOT NULL,
-  adjusted  INTEGER NOT NULL,
-  PRIMARY KEY (symbol, timeframe, ts)
-) WITHOUT ROWID;
-"#;
+/// 与 Cloudflare D1 共用的迁移。一个元素一个版本，按序执行，
+/// 执行到第 n 个就把 `PRAGMA user_version` 记成 n —— D1 没有 user_version，
+/// 它用 `wrangler d1 migrations` 自己记账，所以 SQL 文件里不写 PRAGMA。
+/// 直接 include 同一批文件，避免本地与 D1 的 schema 漂移。
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../worker/migrations/0001_initial.sql"),
+    include_str!("../../worker/migrations/0002_ashare_loop.sql"),
+];
+
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let current: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
+        conn.execute_batch(&format!(
+            "BEGIN; {sql}\nPRAGMA user_version = {}; COMMIT;",
+            i + 1
+        ))?;
+    }
+    Ok(())
+}
 
 impl Store {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -56,7 +52,7 @@ impl Store {
     }
 
     fn from_conn(conn: Connection) -> anyhow::Result<Self> {
-        conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -188,5 +184,173 @@ mod tests {
         st.add(&sym("HK:700"), "腾讯控股").unwrap();
         // 港股补足五位后存储
         assert_eq!(st.watchlist().unwrap()[0].symbol.to_string(), "HK:00700");
+    }
+
+    /// 阶段 1 的 schema，冻结在测试里当 fixture —— 它描述的是「线上旧库长什么样」，
+    /// 不该跟着 MIGRATIONS 一起变，否则升级测试就自证其说了。
+    const PHASE1_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS watchlist (
+  symbol     TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  added_at   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bars (
+  symbol    TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  ts        INTEGER NOT NULL,
+  open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+  close REAL NOT NULL, volume REAL NOT NULL,
+  adjusted  INTEGER NOT NULL,
+  PRIMARY KEY (symbol, timeframe, ts)
+) WITHOUT ROWID;
+"#;
+
+    /// 造一个阶段 1 的旧库（user_version 仍为 0）并塞 3 条自选股，再交给 Store 打开
+    fn open_phase1_db() -> Store {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(PHASE1_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO watchlist (symbol, name, sort_order, added_at) VALUES
+               ('CN:600519', '贵州茅台', 0, 1000),
+               ('HK:00700',  '腾讯控股', 1, 1001),
+               ('US:AAPL',   '苹果',     2, 1002);
+             INSERT INTO settings (key, value) VALUES ('vegas.fast', '144,169');",
+        )
+        .unwrap();
+        Store::from_conn(conn).unwrap()
+    }
+
+    fn user_version(st: &Store) -> i64 {
+        st.conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// sqlite_master 全量快照，用来比对两条路径建出来的 schema
+    fn schema_dump(st: &Store) -> Vec<(String, String, String)> {
+        let conn = st.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    const NEW_TABLES: &[&str] = &[
+        "adj_factors",
+        "sectors",
+        "sector_daily",
+        "sector_members",
+        "scan_results",
+        "ai_cache",
+        "backfill_state",
+        "sync_state",
+    ];
+
+    #[test]
+    fn 旧库升级后自选股一条不丢() {
+        let st = open_phase1_db();
+        let codes: Vec<String> = st
+            .watchlist()
+            .unwrap()
+            .iter()
+            .map(|w| w.symbol.to_string())
+            .collect();
+        assert_eq!(codes, vec!["CN:600519", "HK:00700", "US:AAPL"]);
+        assert_eq!(st.watchlist().unwrap()[0].name, "贵州茅台");
+        // settings 也不该被迁移清掉
+        let v: String = st
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM settings WHERE key = 'vegas.fast'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(v, "144,169");
+    }
+
+    #[test]
+    fn 旧库升级后版本为最新() {
+        assert_eq!(user_version(&open_phase1_db()), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn 升级后所有新表可查询() {
+        let st = open_phase1_db();
+        let conn = st.conn.lock().unwrap();
+        for t in NEW_TABLES {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("新表 {t} 查不了：{e}"));
+            assert_eq!(n, 0);
+        }
+    }
+
+    #[test]
+    fn bars_不再有_adjusted_列() {
+        let st = open_phase1_db();
+        let conn = st.conn.lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('bars')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(!cols.contains(&"adjusted".to_string()), "实际列：{cols:?}");
+        assert!(cols.contains(&"close".to_string()));
+    }
+
+    #[test]
+    fn watchlist_与_settings_有_updated_at_且既有行已填时间() {
+        let st = open_phase1_db();
+        let conn = st.conn.lock().unwrap();
+        for t in ["watchlist", "settings"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {t} WHERE updated_at > 0"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(n > 0, "{t} 的既有行 updated_at 没填");
+        }
+    }
+
+    #[test]
+    fn 新库与升级后的库_schema_一致() {
+        let fresh = Store::open_in_memory().unwrap();
+        let upgraded = open_phase1_db();
+        assert_eq!(user_version(&fresh), user_version(&upgraded));
+        assert_eq!(schema_dump(&fresh), schema_dump(&upgraded));
+    }
+
+    #[test]
+    fn 重复迁移不动已有数据() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO bars (symbol, timeframe, ts, open, high, low, close, volume)
+             VALUES ('CN:600519', 'day', 1, 1.0, 2.0, 0.5, 1.5, 100.0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "重跑迁移把 bars 清空了");
     }
 }
