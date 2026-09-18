@@ -34,3 +34,6 @@ scripts/out/
 
 # rust build
 /target
+
+# ticket 工作目录（执行期临时物）
+.scratch/
