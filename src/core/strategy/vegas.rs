@@ -18,6 +18,10 @@ use crate::core::strategy::{
     Adequacy, Facet, FacetState, MarketData, ParamMap, ParamSpec, Signal, Stance, Strategy,
 };
 
+/// 「预备」维度的标签。板块内排序补位时要按标签找这一维，
+/// 两边各写一份字面量的话，改了名字就会静默失配。
+pub const READY_FACET: &str = "预备";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VegasParams {
     /// 过滤器 EMA 周期
@@ -320,7 +324,7 @@ impl Strategy for Vegas {
                 },
             },
             Facet {
-                label: "预备".into(),
+                label: READY_FACET.into(),
                 state: ready,
                 detail: match ready {
                     FacetState::Bullish if in_band => {

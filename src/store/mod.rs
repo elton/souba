@@ -17,6 +17,18 @@ pub struct WatchItem {
     pub name: String,
 }
 
+/// `scan_results` 的一行。`freshness` 只有 `Long` 才有值（schema 如此约定），
+/// `stance` 存的是稳定标识而不是界面文案。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanRow {
+    pub sector_code: String,
+    pub symbol: Symbol,
+    pub rank: usize,
+    pub stance: String,
+    pub freshness: Option<i64>,
+    pub facets_json: String,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -190,9 +202,8 @@ impl Store {
         Ok(())
     }
 
-    /// 某个板块某天落库的候选，按名次升序。落库是 06 票的输入，
-    /// 本票只写不读，所以读这条路先只给测试用。
-    #[cfg(test)]
+    /// 某个板块某天落库的候选，按名次升序。名次就是板块内涨幅序，
+    /// 求值排序把它当作新鲜度相同时的次序。
     pub fn sector_members(
         &self,
         market: Market,
@@ -216,6 +227,87 @@ impl Store {
             },
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 当日扫描结果整体覆盖：先删 (date, market) 的旧行再写新的，同一个事务里完成 ——
+    /// 分成两步的话，中途失败就会留下「昨天的结果还在、今天的没了也没写进去」的空档。
+    ///
+    /// 调用方必须先把全部行算完再调这里。只要求值阶段出错就不会走到这个函数，
+    /// 库里上一次的结果原样保留（板块列表拉不到时整次扫描 bail 就是这条路）。
+    pub fn record_scan_results(
+        &self,
+        market: Market,
+        date: &str,
+        rows: &[ScanRow],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM scan_results WHERE date = ?1 AND market = ?2",
+            rusqlite::params![date, market.as_str()],
+        )?;
+        for r in rows {
+            tx.execute(
+                "INSERT INTO scan_results
+                   (date, market, sector_code, symbol, rank, stance, freshness, facets_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    date,
+                    market.as_str(),
+                    r.sector_code,
+                    r.symbol.to_string(),
+                    r.rank as i64,
+                    r.stance,
+                    r.freshness,
+                    r.facets_json
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 当日结果，按板块码与名次升序。机会面板（07 票）是它的正经调用方，
+    /// 本票只写不读，所以读这条路先只给测试用。
+    #[cfg(test)]
+    pub fn scan_results(&self, market: Market, date: &str) -> anyhow::Result<Vec<ScanRow>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT sector_code, symbol, rank, stance, freshness, facets_json
+             FROM scan_results WHERE date = ?1 AND market = ?2
+             ORDER BY sector_code, rank",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![date, market.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (sector_code, symbol, rank, stance, freshness, facets_json) = row?;
+            out.push(ScanRow {
+                sector_code,
+                symbol: Symbol::parse(&symbol)?,
+                rank: rank as usize,
+                stance,
+                freshness,
+                facets_json,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 只给测试用的 SQL 逃生口：用来造出「库里有坏数据」这种正常接口造不出的状态。
+    #[cfg(test)]
+    pub fn exec(&self, sql: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        conn.execute_batch(sql)?;
+        Ok(())
     }
 
     /// `date` 之前最近 `days` 天的快照，用来算热度。不足就返回实际有的。
@@ -699,6 +791,85 @@ mod tests {
         let hist = st.sector_history(Market::Cn, "x", "2026-09-18", 5).unwrap();
         assert_eq!(hist.len(), 1);
         assert!((hist[0].change_pct - 1.0).abs() < 1e-9);
+    }
+
+    fn scan_row(sector: &str, symbol: &str, rank: usize, stance: &str) -> ScanRow {
+        ScanRow {
+            sector_code: sector.into(),
+            symbol: sym(symbol),
+            rank,
+            stance: stance.into(),
+            freshness: None,
+            facets_json: "[]".into(),
+        }
+    }
+
+    #[test]
+    fn 扫描结果落库后按板块与名次读回() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_scan_results(
+            Market::Cn,
+            "2026-09-18",
+            &[
+                scan_row("gn_b", "CN:000001", 1, "long"),
+                scan_row("gn_a", "CN:300750", 2, "watch"),
+                scan_row("gn_a", "CN:600519", 1, "long"),
+            ],
+        )
+        .unwrap();
+        let got = st.scan_results(Market::Cn, "2026-09-18").unwrap();
+        let keys: Vec<(String, usize)> = got
+            .iter()
+            .map(|r| (r.sector_code.clone(), r.rank))
+            .collect();
+        assert_eq!(
+            keys,
+            [("gn_a".into(), 1), ("gn_a".into(), 2), ("gn_b".into(), 1)]
+        );
+        assert_eq!(got[0].symbol, sym("CN:600519"));
+    }
+
+    #[test]
+    fn 同日重跑覆盖当日结果且不动昨日() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_scan_results(Market::Cn, "2026-09-17", &[scan_row("gn_a", "CN:600519", 1, "long")])
+            .unwrap();
+        st.record_scan_results(Market::Cn, "2026-09-18", &[scan_row("gn_a", "CN:000001", 1, "long")])
+            .unwrap();
+        // 同一天第二次跑，结果完全换了一批 —— 不能跟上一次的混在一起
+        st.record_scan_results(Market::Cn, "2026-09-18", &[scan_row("gn_a", "CN:300750", 1, "watch")])
+            .unwrap();
+
+        let today = st.scan_results(Market::Cn, "2026-09-18").unwrap();
+        assert_eq!(today.len(), 1);
+        assert_eq!(today[0].symbol, sym("CN:300750"));
+        let yday = st.scan_results(Market::Cn, "2026-09-17").unwrap();
+        assert_eq!(yday.len(), 1, "昨天的结果不该被今天的重跑清掉");
+        assert_eq!(yday[0].symbol, sym("CN:600519"));
+    }
+
+    #[test]
+    fn 清当日只清本市场() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_scan_results(Market::Hk, "2026-09-18", &[scan_row("hk_a", "HK:00700", 1, "long")])
+            .unwrap();
+        st.record_scan_results(Market::Cn, "2026-09-18", &[scan_row("gn_a", "CN:600519", 1, "long")])
+            .unwrap();
+        assert_eq!(st.scan_results(Market::Hk, "2026-09-18").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 新鲜度可空并原样读回() {
+        let st = Store::open_in_memory().unwrap();
+        let mut fresh = scan_row("gn_a", "CN:600519", 1, "long");
+        fresh.freshness = Some(3);
+        fresh.facets_json = r#"[{"label":"趋势","state":"↑","detail":"慢隧道向上倾斜"}]"#.into();
+        st.record_scan_results(Market::Cn, "2026-09-18", &[fresh.clone(), scan_row("gn_a", "CN:000001", 2, "backfilling")])
+            .unwrap();
+        let got = st.scan_results(Market::Cn, "2026-09-18").unwrap();
+        assert_eq!(got[0], fresh);
+        assert_eq!(got[1].freshness, None);
+        assert_eq!(got[1].stance, "backfilling");
     }
 
     // 真实响应：茅台全量日线的抽样（首尾各 20 根 + 几个对照日前后各 5 根）与全量 qfq 因子

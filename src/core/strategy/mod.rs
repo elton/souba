@@ -27,6 +27,16 @@ pub enum Stance {
 }
 
 impl Stance {
+    /// 落库用的稳定标识。界面文案走 `label()` —— 改文案不该动到库里的值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stance::Long => "long",
+            Stance::Watch => "watch",
+            Stance::Exit => "exit",
+            Stance::Insufficient => "insufficient",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Stance::Long => "做多",

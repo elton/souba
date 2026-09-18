@@ -1,4 +1,5 @@
-//! 扫描编排：拉板块列表 → 落库 → 按热度排序 → 每个板块取候选 → 回补缺的历史 → 输出。
+//! 扫描编排：拉板块列表 → 落库 → 按热度排序 → 每个板块取候选 → 回补缺的历史 →
+//! 求值排序 → 落 `scan_results` → 输出。
 //!
 //! 这一层保持薄：能测的东西都在 `core::sector`（热度）与 `store`（幂等落库）里，
 //! 这里只负责把它们串起来和排版。
@@ -19,6 +20,8 @@ use crate::source::sina_sector::{Members, SectorSource};
 use crate::source::backfill;
 use crate::store::Store;
 
+pub mod evaluate;
+
 /// 扫描参数。默认值来自 spec 的「默认参数」一节。
 pub use crate::settings::ScanParams;
 
@@ -32,7 +35,8 @@ pub struct Ranked {
 ///
 /// 板块列表拉不到就整体失败 —— 榜单缺了一半不如不给。
 pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
-    let p = crate::settings::Settings::load(store)?.scan;
+    let cfg = crate::settings::Settings::load(store)?;
+    let p = cfg.scan.clone();
     let date = today();
     let src = SectorSource::new()?;
     let mut all = fetch(&src, SectorKind::Industry).await?;
@@ -58,7 +62,16 @@ pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
     }
 
     let q = queue(store, &by_sector)?;
-    backfill_all(store, q).await
+    backfill_all(store, q).await?;
+
+    // 回补完才求值 —— 反过来的话首日每只都是「回补中」，白跑一趟
+    let list: Vec<(String, String)> = ranked
+        .iter()
+        .map(|r| (r.sector.code.clone(), r.sector.name.clone()))
+        .collect();
+    let report = evaluate::run(store, Market::Cn, &date, &list, &cfg)?;
+    print!("{}", evaluate::render(&report, &p));
+    Ok(())
 }
 
 /// 逐只回补并打印进度。单只失败只记下来继续 —— 一只退市股拉不到历史，
