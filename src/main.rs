@@ -1,4 +1,8 @@
+mod ai;
 mod core;
+mod settings;
+mod scan;
+mod loader;
 mod source;
 mod store;
 mod ui;
@@ -15,25 +19,112 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 use crate::core::bar::Timeframe;
 use crate::core::quote::Quote;
-use crate::core::symbol::Symbol;
+use crate::core::symbol::{Market, Symbol};
+use crate::loader::BarKey;
+use crate::settings::ScanParams;
 use crate::source::QuoteSource;
-use crate::source::history::{HistoryClient, HistoryError};
 use crate::source::tencent::TencentSource;
 use crate::store::Store;
-use crate::ui::detail::{BarState, DetailView};
+use crate::core::strategy::Signal;
+use crate::ui::detail::{AiState, BarState, DetailView};
 use crate::ui::surface::{Backend, Surface};
 use crate::ui::layout::{Breakpoint, MIN_HEIGHT, MIN_WIDTH, split};
+use crate::ui::opportunities::{self, Panel, PanelView, ScanStatus};
 use crate::ui::watchlist::{ColumnKey, columns_for, freshness_label, truncate_display};
-use crate::ui::{App, Screen};
+use crate::ui::{App, Rows, Screen};
 
 /// 盘中刷新间隔。节流器保证不会打得更快。
 const REFRESH: Duration = Duration::from_secs(3);
 /// 一次拉多少根历史。EMA576 要 1330 根才收敛，日线给足；
 /// 分钟线源本身也给不了这么多，多要无害。
 const HISTORY_BARS: usize = 1500;
+/// 腾讯一次最多 100 只。自选股 + 面板通常远不到，截断只是兜底。
+const QUOTE_BATCH: usize = 100;
+/// 解读文本区的底栏提示。详情屏与机会面板共用同一套键位。
+const AI_PANE_HINT: &str = " ↑↓/jk PgUp/PgDn 滚动   Home/End 首尾   R 重新解读   Esc 关闭解读";
 
-/// 历史加载请求：标的 + 周期
-type BarKey = (Symbol, Timeframe);
+/// 一次 AI 解读请求。喂给模型的是算好的 `Signal`，不是原始 K 线。
+/// `force` 都表示绕过当天的缓存重问。
+enum AiJob {
+    /// 详情屏：这一只
+    One {
+        symbol: Symbol,
+        signal: Signal,
+        force: bool,
+    },
+    /// 机会面板：当天全部板块 top 一起排序
+    Group { panel: Panel, force: bool },
+}
+
+/// 解读结果是给谁的。`None` = 面板那份整组解读。
+type AiAnswer = (Option<Symbol>, AiState);
+
+/// 后台扫描：起任务、收进度、重装面板都在这里。
+///
+/// 扫描跑在自己的 tokio 任务里，主循环只读通道 —— 扫描要跑十几分钟，
+/// 阻塞在它上面等于看盘这条主路径被扫描拖垮。
+struct Scanner {
+    store: Arc<Store>,
+    params: ScanParams,
+    tx: tokio::sync::mpsc::UnboundedSender<scan::Progress>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<scan::Progress>,
+}
+
+impl Scanner {
+    fn new(store: Arc<Store>, params: ScanParams) -> Self {
+        // 无界通道：回补一百多只会推出上千条进度，有界通道满了就得丢，
+        // 丢掉的偏偏可能是 Done 或 Failed
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            store,
+            params,
+            tx,
+            rx,
+        }
+    }
+
+    /// 起一次扫描。调用方负责先确认没有别的扫描在跑。
+    fn spawn(&self) {
+        let store = Arc::clone(&self.store);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // 失败的原因已经通过 Progress::Failed 到了面板，这里不用再管
+            let _ = scan::run(&store, move |p| {
+                let _ = tx.send(p);
+            })
+            .await;
+        });
+    }
+
+    fn panel(&self) -> anyhow::Result<Panel> {
+        opportunities::load(&self.store, Market::Cn, &scan::today(), &self.params)
+    }
+}
+
+/// 自选股 + 面板里的标的，去重后交给同一次批量报价 ——
+/// 腾讯一个请求就能混市场拿 100 只，按屏分开请求纯属白打。
+fn quote_symbols(watch: &[Symbol], panel: &Panel) -> Vec<Symbol> {
+    let mut out = watch.to_vec();
+    for s in panel.symbols() {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.truncate(QUOTE_BATCH);
+    out
+}
+
+/// 光标当前指着哪只。面板和从面板进来的详情屏看面板光标，其余看自选股光标。
+fn focused(app: &App, watch: &[Symbol], panel: &Panel) -> Option<Symbol> {
+    let from_panel = app.screen == Screen::Opportunities
+        || (app.screen == Screen::Detail && app.detail_from == Screen::Opportunities);
+    if from_panel {
+        return panel
+            .pick(app.sector_cursor, app.pick_cursor)
+            .map(|p| p.symbol.clone());
+    }
+    watch.get(app.selected).cloned()
+}
 
 /// 把命令行给的代码解析成 Symbol。
 ///
@@ -55,7 +146,7 @@ fn parse_cli_symbol(raw: &str) -> anyhow::Result<Symbol> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let store = Store::open(&Store::default_path()?)?;
+    let store = Arc::new(Store::open(&Store::default_path()?)?);
     seed_if_empty(&store)?;
 
     let arg = std::env::args().nth(1);
@@ -64,9 +155,20 @@ async fn main() -> anyhow::Result<()> {
             "souba — 终端行情与策略终端\n\n\
              用法：\n  \
              souba              打开自选股列表\n  \
-             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700"
+             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700\n  \
+             souba set <键> <值>  修改策略与扫描参数\n  \
+             souba get <键>       查看某个参数的当前值与默认值\n  \
+             souba settings       列出全部参数\n  \
+             souba scan           拉板块与候选、回补缺的历史并打印热度榜"
         );
         return Ok(());
+    }
+    if let Some(cmd @ ("set" | "get" | "settings")) = arg.as_deref() {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return settings::run(cmd, &store, &rest);
+    }
+    if arg.as_deref() == Some("scan") {
+        return scan::run_cli(&store).await;
     }
     let direct = match arg {
         Some(a) => Some(parse_cli_symbol(&a)?),
@@ -80,11 +182,22 @@ async fn main() -> anyhow::Result<()> {
     {
         watch.insert(0, d.clone());
     }
-    let watch = watch;
 
-    // 报价：后台常驻刷新
+    let cfg = settings::Settings::load(&store)?;
+    let mut scanner = Scanner::new(Arc::clone(&store), cfg.scan.clone());
+    let mut panel = scanner.panel().unwrap_or_else(|e| {
+        // 面板读不出来不该让人打不开终端 —— 空面板 + 一行原因就够了
+        eprintln!("[souba] 扫描结果读取失败：{e}");
+        Panel {
+            date: scan::today(),
+            sectors: Vec::new(),
+        }
+    });
+
+    // 报价：后台常驻刷新。要报的标的会变（面板扫出新结果、`a` 加了自选），
+    // 所以标的表也走一条 watch 通道推给它，而不是启动时定死一份。
     let (qtx, mut qrx) = tokio::sync::watch::channel(Vec::<Quote>::new());
-    let quote_syms = watch.clone();
+    let (sym_tx, sym_rx) = tokio::sync::watch::channel(quote_symbols(&watch, &panel));
     tokio::spawn(async move {
         let source = match TencentSource::new() {
             Ok(s) => s,
@@ -94,7 +207,8 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         loop {
-            match source.quotes(&quote_syms).await {
+            let syms = sym_rx.borrow().clone();
+            match source.quotes(&syms).await {
                 Ok(qs) => {
                     let _ = qtx.send(qs);
                 }
@@ -105,31 +219,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 历史：按需加载，请求走 channel，结果走 watch
-    let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<BarKey>(8);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<BarKey>(8);
     let (bar_tx, mut bar_rx) =
         tokio::sync::watch::channel::<(Option<BarKey>, BarState)>((None, BarState::Loading));
-    tokio::spawn(async move {
-        let client = match HistoryClient::new() {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                let _ = bar_tx.send((None, BarState::Failed(e.to_string())));
-                return;
-            }
-        };
-        while let Some(key) = req_rx.recv().await {
-            let _ = bar_tx.send((Some(key.clone()), BarState::Loading));
-            let state = match client.bars(&key.0, key.1, HISTORY_BARS).await {
-                Ok(bars) => BarState::Ready(bars),
-                // 「没有数据源」和「拉取失败」要分开 —— 前者重试多少次都没用
-                Err(e @ (HistoryError::MarketUnsupported(_)
-                | HistoryError::TimeframeUnsupported { .. })) => {
-                    BarState::Unsupported(e.to_string())
-                }
-                Err(e) => BarState::Failed(e.to_string()),
-            };
-            let _ = bar_tx.send((Some(key), state));
-        }
-    });
+    loader::spawn(store.clone(), req_rx, bar_tx, HISTORY_BARS);
 
     let backend = Backend::detect();
     let mut terminal = ratatui::init();
@@ -138,6 +231,58 @@ async fn main() -> anyhow::Result<()> {
     // 的 EnableMouseCapture，见 kitty::MOUSE_ON 的注释。
     let mouse_ok = crate::ui::kitty::emit(crate::ui::kitty::MOUSE_ON).is_ok();
     let mut app = App::new();
+    app.vegas = cfg.vegas;
+
+    // 今天还没扫过就后台扫一次，主界面照常先出来（story 41）。
+    // 已经有今天的结果就什么都不做 —— 重跑一次拿到的是同一份，白等十几分钟。
+    if store.scan_results(Market::Cn, &scan::today())?.is_empty() && should_start_scan(&mut app) {
+        scanner.spawn();
+    }
+
+    // AI：按需解读，沿用 K 线那套「请求走 mpsc、结果走 mpsc」
+    let (ai_tx, mut ai_rx) = tokio::sync::mpsc::channel::<AiJob>(4);
+    let (ai_res_tx, mut ai_res_rx) = tokio::sync::mpsc::channel::<AiAnswer>(8);
+    let ai_store = Arc::clone(&store);
+    let ai_model = cfg.ai_model.clone();
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .user_agent("souba/0.1")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[souba] AI 客户端初始化失败：{e}");
+                return;
+            }
+        };
+        while let Some(job) = ai_rx.recv().await {
+            // 每次都重读端点配置 —— 中途补上 .env 里的 key 不该需要重启
+            let ep = ai::Endpoint::from_env(&ai_model).ok();
+            let day = chrono::Utc::now().date_naive();
+            let (who, answer) = match job {
+                AiJob::One { symbol, signal, force } => {
+                    let r = ai::interpret(&ai_store, &symbol, &signal, ep, force, day, |ep, body| {
+                        ai::post(&client, ep, body)
+                    })
+                    .await;
+                    (Some(symbol), r)
+                }
+                AiJob::Group { panel, force } => {
+                    let r = ai::interpret_panel(&ai_store, &panel, ep, force, day, |ep, body| {
+                        ai::post(&client, ep, body)
+                    })
+                    .await;
+                    (None, r)
+                }
+            };
+            let state = match answer {
+                Ok(text) => AiState::Ready(text),
+                Err(e) => AiState::Failed(e.to_string()),
+            };
+            let _ = ai_res_tx.send((who, state)).await;
+        }
+    });
     if let Some(d) = &direct {
         app.selected = watch.iter().position(|s| s == d).unwrap_or(0);
         app.screen = Screen::Detail;
@@ -146,10 +291,15 @@ async fn main() -> anyhow::Result<()> {
     let result = run(
         &mut terminal,
         &mut app,
-        &watch,
+        &mut watch,
+        &mut panel,
+        &mut scanner,
         &mut qrx,
+        &sym_tx,
         &req_tx,
         &mut bar_rx,
+        &ai_tx,
+        &mut ai_res_rx,
         backend,
     )
     .await;
@@ -164,48 +314,122 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+// 参数就是几组后台通道，捆成一个结构体只是换个地方写同样的字段
+#[allow(clippy::too_many_arguments)]
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    watch: &[Symbol],
+    watch: &mut Vec<Symbol>,
+    panel: &mut Panel,
+    scanner: &mut Scanner,
     qrx: &mut tokio::sync::watch::Receiver<Vec<Quote>>,
+    sym_tx: &tokio::sync::watch::Sender<Vec<Symbol>>,
     req_tx: &tokio::sync::mpsc::Sender<BarKey>,
     bar_rx: &mut tokio::sync::watch::Receiver<(Option<BarKey>, BarState)>,
+    ai_tx: &tokio::sync::mpsc::Sender<AiJob>,
+    ai_res_rx: &mut tokio::sync::mpsc::Receiver<AiAnswer>,
     backend: Backend,
 ) -> anyhow::Result<()> {
     // 十字光标随鼠标动，所以鼠标位置也要纳入重绘判定 —— 否则位图不会刷新
-    type Stamp = (Screen, usize, Timeframe, crate::ui::detail::IndicatorKind,
-                  crate::ui::viewport::Viewport, (u16, u16), usize);
-    let mut last_stamp: Stamp = (Screen::Watchlist, usize::MAX, Timeframe::Day,
+    // AI 文本区开着时这一帧不画 K 线，所以它也得进 stamp —— 否则残留的位图
+    // 会盖在解读文字上（位图在字符层之上，不清就一直在）
+    type Cursor = (usize, usize, usize);
+    type Stamp = (Screen, Cursor, Timeframe, crate::ui::detail::IndicatorKind,
+                  crate::ui::viewport::Viewport, (u16, u16), usize, bool);
+    let mut last_stamp: Stamp = (Screen::Watchlist, (usize::MAX, usize::MAX, usize::MAX),
+                                 Timeframe::Day,
                                  crate::ui::detail::IndicatorKind::Macd,
                                  crate::ui::viewport::Viewport { span: 0, offset: usize::MAX },
-                                 (0, 0), usize::MAX);
+                                 (0, 0), usize::MAX, false);
+    // 一次只许一个解读在飞。整组那份要读几十条 Signal，连按两下就是两份钱
+    let mut ai_inflight = false;
     while !app.should_quit {
+        // 扫描进度：只动面板的状态与数据，自选股那条刷新路径完全不受影响（story 44）
+        while let Ok(p) = scanner.rx.try_recv() {
+            opportunities::apply(&mut app.scan_status, &p);
+            if p == scan::Progress::Done {
+                match scanner.panel() {
+                    Ok(fresh) => {
+                        *panel = fresh;
+                        clamp_panel(app, panel);
+                        let _ = sym_tx.send(quote_symbols(watch, panel));
+                    }
+                    Err(e) => app.notice = Some(format!("扫描结果读取失败：{e}")),
+                }
+            }
+        }
+        if app.scan_request {
+            app.scan_request = false;
+            if should_start_scan(app) {
+                scanner.spawn();
+            }
+        }
+        if app.add_request {
+            app.add_request = false;
+            app.notice = add_to_watchlist(&scanner.store, app, watch, panel);
+            let _ = sym_tx.send(quote_symbols(watch, panel));
+        }
+
         if app.bars_dirty {
             app.bars_dirty = false;
-            if let Some(sym) = watch.get(app.selected) {
+            if let Some(sym) = focused(app, watch, panel) {
                 // 满了就丢弃这次请求 —— 用户还在连按切换，最后一次会补上
-                let _ = req_tx.try_send((sym.clone(), app.timeframe));
+                let _ = req_tx.try_send((sym, app.timeframe));
             }
         }
 
         let quotes = qrx.borrow().clone();
         let (bar_key, bar_state) = bar_rx.borrow().clone();
 
+        // 结果先收，再派发本轮的请求
+        while let Ok((who, state)) = ai_res_rx.try_recv() {
+            ai_inflight = false;
+            let fits = match &who {
+                // 整组那份只贴回面板 —— 用户已经进详情屏了就别拿它盖住单只解读
+                None => app.screen == Screen::Opportunities,
+                // 用户已经翻到别的标的了，就别拿旧标的的解读盖上去
+                Some(sym) => focused(app, watch, panel).as_ref() == Some(sym),
+            };
+            if fits && let Some(pane) = &mut app.ai {
+                pane.state = state;
+                pane.scroll = 0;
+            }
+        }
+        if let Some(force) = app.ai_request.take() {
+            let job = if ai_inflight {
+                Err("上一次解读还没回来，稍后再按".to_string())
+            } else if app.screen == Screen::Opportunities {
+                group_job(panel, force)
+            } else {
+                one_job(app, watch, panel, &quotes, bar_key.as_ref(), &bar_state, force)
+            };
+            match job {
+                Ok(job) => ai_inflight = ai_tx.try_send(job).is_ok(),
+                Err(why) => {
+                    if let Some(pane) = &mut app.ai {
+                        pane.state = AiState::Failed(why);
+                    }
+                }
+            }
+        }
+
         // 先算 stamp 再决定要不要画位图 —— 之前是画完才发现没变然后扔掉，
         // 白白付出一张 400 万像素画布的分配与绘制开销。鼠标移动时这是主要瓶颈。
         let stamp = (
             app.screen,
-            app.selected,
+            (app.selected, app.sector_cursor, app.pick_cursor),
             app.timeframe,
             app.indicator,
             app.viewport,
             terminal.size().map(|s| (s.width, s.height)).unwrap_or_default(),
             bar_len(&bar_state),
+            app.ai.is_some(),
         );
         let bitmap_unchanged = stamp == last_stamp;
         let mut surface = Surface::with_skip(backend, bitmap_unchanged);
-        terminal.draw(|f| draw(f, app, watch, &quotes, &bar_key, &bar_state, &mut surface))?;
+        terminal.draw(|f| {
+            draw(f, app, watch, panel, &quotes, &bar_key, &bar_state, &mut surface)
+        })?;
 
         // 位图叠在字符层之上，必须在 ratatui 画完之后才发。
         if let Some(seq) = surface.escape.take() {
@@ -229,10 +453,18 @@ async fn run(
         const MAX_DRAIN: usize = 64;
         if event::poll(Duration::from_millis(100))? {
             let bars_now = bar_len(&bar_state);
+            let rows = Rows {
+                watch: watch.len(),
+                sectors: panel.sectors.len(),
+                picks: panel
+                    .sector(app.sector_cursor)
+                    .map_or(0, |s| s.picks.len()),
+                bars: bars_now,
+            };
             let mut drained = 0usize;
             loop {
                 match event::read()? {
-                    Event::Key(k) => app.on_key_with(k, watch.len(), bars_now),
+                    Event::Key(k) => app.on_key_with(k, rows),
                     Event::Mouse(m) => {
                         use crossterm::event::MouseEventKind;
                         app.on_mouse(m);
@@ -256,6 +488,90 @@ async fn run(
     Ok(())
 }
 
+/// 面板 `?`：当天全部板块 top 一起交给模型。没有结果就别问 —— 一个空数组
+/// 只会换回一段没内容的话。
+fn group_job(panel: &Panel, force: bool) -> Result<AiJob, String> {
+    if panel.sectors.iter().all(|s| s.picks.is_empty()) {
+        return Err("今天还没有扫描结果可解读 —— 先按 r 扫一次".into());
+    }
+    Ok(AiJob::Group {
+        panel: panel.clone(),
+        force,
+    })
+}
+
+/// 详情屏 `?`：光标这一只。手上这份 K 线必须确实是这只标的、这个周期的，
+/// 否则解读的是别人的信号。
+fn one_job(
+    app: &App,
+    watch: &[Symbol],
+    panel: &Panel,
+    quotes: &[Quote],
+    bar_key: Option<&BarKey>,
+    bar_state: &BarState,
+    force: bool,
+) -> Result<AiJob, String> {
+    let sym = focused(app, watch, panel).ok_or_else(|| "没有选中的标的".to_string())?;
+    let fresh = bar_key == Some(&(sym.clone(), app.timeframe));
+    let quote = quotes.iter().find(|q| q.symbol == sym);
+    let signal = fresh
+        .then(|| ui::detail::day_signal(&sym, quote, app.timeframe, bar_state, app.vegas))
+        .flatten()
+        .ok_or_else(|| {
+            "还没有可解读的信号 —— 策略只在日线上求值，先切回日线等 K 线加载完".to_string()
+        })?;
+    Ok(AiJob::One {
+        symbol: sym,
+        signal,
+        force,
+    })
+}
+
+/// 扫描的闸门：正在跑就不起第二个，只留一句提示。启动自动扫和手动 `r`
+/// 走的是同一道闸 —— 两个扫描同时跑会对着同一批接口重复打，很容易被封 IP。
+///
+/// 返回 true = 调用方该起任务了。置位放在这里而不是任务里：第一条进度到达
+/// 之前还有一段空窗，那期间再按一次 `r` 就会起第二个。
+fn should_start_scan(app: &mut App) -> bool {
+    if app.scan_status.running() {
+        app.notice = Some("扫描正在进行中".into());
+        return false;
+    }
+    app.scan_status = ScanStatus::Sectors;
+    true
+}
+
+/// 重扫之后板块可能变少、某个板块的 top 可能变短，光标要收回来 ——
+/// 否则面板看着像空的，`Enter` 也会打不开东西。
+fn clamp_panel(app: &mut App, panel: &Panel) {
+    app.sector_cursor = app
+        .sector_cursor
+        .min(panel.sectors.len().saturating_sub(1));
+    let picks = panel.sector(app.sector_cursor).map_or(0, |s| s.picks.len());
+    app.pick_cursor = app.pick_cursor.min(picks.saturating_sub(1));
+}
+
+/// 面板 `a`：把光标标的加进自选。名称取候选表里的那个。
+/// 返回底栏要显示的那行提示。
+fn add_to_watchlist(
+    store: &Store,
+    app: &App,
+    watch: &mut Vec<Symbol>,
+    panel: &Panel,
+) -> Option<String> {
+    let p = panel.pick(app.sector_cursor, app.pick_cursor)?;
+    if watch.contains(&p.symbol) {
+        return Some(format!("{} 已在自选", p.name));
+    }
+    match store.add(&p.symbol, &p.name) {
+        Ok(()) => {
+            watch.push(p.symbol.clone());
+            Some(format!("{} 已加入自选", p.name))
+        }
+        Err(e) => Some(format!("加入自选失败：{e}")),
+    }
+}
+
 fn bar_len(s: &BarState) -> usize {
     match s {
         BarState::Ready(b) => b.len(),
@@ -263,15 +579,18 @@ fn bar_len(s: &BarState) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
     app: &App,
     watch: &[Symbol],
+    panel: &Panel,
     quotes: &[Quote],
     bar_key: &Option<BarKey>,
     bar_state: &BarState,
     surface: &mut Surface,
 ) {
+    let ai = app.ai.as_ref();
     let area = frame.area();
     let bp = Breakpoint::of(area);
     if bp == Breakpoint::TooSmall {
@@ -293,15 +612,51 @@ fn draw(
 
     match app.screen {
         Screen::Watchlist => {
-            draw_watchlist(frame, panes.body, app, quotes, bp);
+            draw_watchlist(frame, panes.body, app, watch, quotes, bp);
             frame.render_widget(
-                Paragraph::new(" ↑↓/jk 移动   Enter 详情   q 退出")
+                Paragraph::new(" ↑↓/jk 移动   Enter 详情   s 机会面板   q 退出")
                     .style(Style::default().fg(Color::DarkGray)),
                 panes.footer,
             );
         }
+        Screen::Opportunities => {
+            // 文本区开着就盖住整个面板 —— 表和解读并排会把两边都挤成没法看，
+            // 跟详情屏一个待遇
+            if let Some(pane) = ai {
+                ui::detail::render_ai(frame, panes.body, pane);
+            } else {
+                opportunities::render(
+                    frame,
+                    panes.body,
+                    &PanelView {
+                        panel,
+                        status: &app.scan_status,
+                        quotes,
+                        sector_cursor: app.sector_cursor,
+                        pick_cursor: app.pick_cursor,
+                        focus_picks: app.focus_picks,
+                        bp,
+                    },
+                );
+            }
+            // 提示占掉底栏那一行 —— 面板里没有别的地方能放一句「已在自选」
+            let hint = if ai.is_some() {
+                AI_PANE_HINT.to_string()
+            } else {
+                match &app.notice {
+                    Some(n) => format!(" {n}"),
+                    None => " ↑↓ 选板块   Tab 切标的   Enter 详情   a 加自选   ? AI 解读   r 重扫   Esc 返回"
+                        .to_string(),
+                }
+            };
+            frame.render_widget(
+                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+                panes.footer,
+            );
+        }
         Screen::Detail => {
-            let sym = watch.get(app.selected);
+            let owned = focused(app, watch, panel);
+            let sym = owned.as_ref();
             let quote = sym.and_then(|s| quotes.iter().find(|q| &q.symbol == s));
             // 请求的键与回来的键不一致时说明还在路上，不要拿旧标的的数据冒充新标的
             let want = sym.map(|s| (s.clone(), app.timeframe));
@@ -323,15 +678,19 @@ fn draw(
                         viewport: app.viewport,
                         surface_label: surface.backend.label(),
                         mouse: app.mouse,
+                        vegas: app.vegas,
+                        ai,
                     },
                     surface,
                 );
             }
+            let hint = if ai.is_some() {
+                AI_PANE_HINT
+            } else {
+                " ←→ 滚动   =- 缩放/滚轮   鼠标悬停读数   Tab 切周期   ↑↓ 切标的   i 切指标   ? AI 解读   Esc 返回"
+            };
             frame.render_widget(
-                Paragraph::new(
-                    " ←→ 滚动   =- 缩放/滚轮   鼠标悬停读数   Tab 切周期   ↑↓ 切标的   i 切指标   Esc 返回",
-                )
-                    .style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
                 panes.footer,
             );
         }
@@ -342,6 +701,7 @@ fn draw_watchlist(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     app: &App,
+    watch: &[Symbol],
     quotes: &[Quote],
     bp: Breakpoint,
 ) {
@@ -352,8 +712,11 @@ fn draw_watchlist(
             .map(|c| Cell::from(truncate_display(c.title, c.cells as usize))),
     );
 
+    // 报价那一批里还有机会面板的标的，自选股列表只显示自选股的 ——
+    // 扫描结果不往这张表里掺（story 29）
     let rows: Vec<Row> = quotes
         .iter()
+        .filter(|q| watch.contains(&q.symbol))
         .map(|q| {
             // A股 惯例红涨绿跌
             let color = if q.is_up() { Color::Red } else { Color::Green };
@@ -453,11 +816,21 @@ pub(crate) mod render_tests {
     }
 
     pub(crate) fn render_with(w: u16, h: u16, app: &App, bars: &BarState) -> Buffer {
+        render_full(w, h, app, bars, &Panel::default())
+    }
+
+    pub(crate) fn render_full(
+        w: u16,
+        h: u16,
+        app: &App,
+        bars: &BarState,
+        panel: &Panel,
+    ) -> Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let watch = watch();
         let key = watch.first().map(|s| (s.clone(), app.timeframe));
         let mut surface = crate::ui::surface::Surface::new(crate::ui::surface::Backend::Braille);
-        term.draw(|f| draw(f, app, &watch, &sample(), &key, bars, &mut surface))
+        term.draw(|f| draw(f, app, &watch, panel, &sample(), &key, bars, &mut surface))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -657,6 +1030,51 @@ mod detail_render_tests {
     }
 
     #[test]
+    fn 解读文本区盖住k线并换掉底栏提示() {
+        let mut app = detail_app();
+        let 关着 = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(200))), 140, 40);
+        assert!(关着.contains("? AI 解读"), "底栏要告诉用户按哪个键：{关着}");
+
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(
+                "机器生成的策略分析，不构成投资建议\n\n慢隧道向上倾斜。".into(),
+            ),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        let 开着 = text_of(&render_with(140, 40, &app, &BarState::Ready(fake_bars(200))), 140, 40);
+        assert!(开着.contains("AI 解读"), "{开着}");
+        assert!(开着.contains("不构成投资建议"), "免责声明必须在屏幕上：{开着}");
+        assert!(开着.contains("Esc 关闭解读"), "底栏要换成文本区的键位：{开着}");
+        assert!(!开着.contains("MACD"), "文本区开着时不该还画指标面板");
+    }
+
+    #[test]
+    fn 解读打开时详情屏每行宽度仍等于终端宽度() {
+        let mut app = detail_app();
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(
+                "机器生成的策略分析，不构成投资建议。慢隧道向上倾斜，EMA12 站上快隧道上沿。".repeat(8),
+            ),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        for (w, h) in [(40u16, 24u16), (80, 24), (140, 40), (240, 70)] {
+            let buf = render_with(w, h, &app, &BarState::Ready(fake_bars(200)));
+            for y in 0..h {
+                let mut width = 0usize;
+                let mut x = 0u16;
+                while x < w {
+                    let sw = unicode_width::UnicodeWidthStr::width(buf[(x, y)].symbol()).max(1);
+                    width += sw;
+                    x += sw as u16;
+                }
+                assert_eq!(width, w as usize, "{w}x{h} 第 {y} 行宽度 {width} != {w}");
+            }
+        }
+    }
+
+    #[test]
     fn 详情屏各尺寸都不panic() {
         for (w, h) in [(40u16, 24u16), (80, 24), (120, 40), (240, 70)] {
             let _ = render_with(w, h, &detail_app(), &BarState::Ready(fake_bars(300)));
@@ -714,5 +1132,213 @@ mod cli_tests {
     fn 错误信息说清怎么改() {
         let e = parse_cli_symbol("7203").unwrap_err().to_string();
         assert!(e.contains("CN:600519") && e.contains("JP:7203"), "错误信息要给出正确写法：{e}");
+    }
+}
+
+#[cfg(test)]
+mod panel_render_tests {
+    use super::render_tests::*;
+    use super::*;
+    use crate::core::sector::{Heat, SectorKind};
+    use crate::ui::opportunities::{PanelPick, PanelSector};
+    use unicode_width::UnicodeWidthStr;
+
+    fn panel() -> Panel {
+        Panel {
+            date: "2026-09-18".into(),
+            sectors: vec![PanelSector {
+                name: "华为汽车".into(),
+                kind: SectorKind::Concept,
+                heat: Heat {
+                    heat: 12.5,
+                    turnover_ratio: Some(3.0),
+                    cum_change: 9.5,
+                    today_change: 3.2,
+                },
+                picks: vec![PanelPick {
+                    symbol: Symbol::parse("CN:002965").unwrap(),
+                    name: "祥鑫科技".into(),
+                    stance: "long".into(),
+                    fresh_bars: Some(2),
+                    facets: "预备↑ 位置↑ 确认↑ 趋势→ 过滤↓".into(),
+                    facets_json: r#"[{"label":"趋势","state":"↑","detail":"慢隧道向上倾斜"}]"#
+                        .into(),
+                }],
+            }],
+        }
+    }
+
+    fn panel_app() -> App {
+        let mut app = App::new();
+        app.screen = Screen::Opportunities;
+        app
+    }
+
+    fn text_of(buf: &ratatui::buffer::Buffer, w: u16, h: u16) -> String {
+        (0..h)
+            .map(|y| {
+                let mut out = String::new();
+                let mut x = 0u16;
+                while x < w {
+                    let s = buf[(x, y)].symbol();
+                    out.push_str(s);
+                    x += s.width().max(1) as u16;
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn 列表屏底栏告诉用户按s进机会面板() {
+        let t = text_of(&render_at(140, 40), 140, 40);
+        assert!(t.contains("s 机会面板"), "{t}");
+    }
+
+    #[test]
+    fn 面板屏底栏是面板自己的键位() {
+        let buf = render_full(140, 40, &panel_app(), &BarState::Loading, &panel());
+        let t = text_of(&buf, 140, 40);
+        assert!(t.contains("Enter 详情") && t.contains("a 加自选"), "{t}");
+        assert!(t.contains("r 重扫"), "{t}");
+        assert!(t.contains("华为汽车") && t.contains("祥鑫科技"), "面板内容没画出来：{t}");
+    }
+
+    #[test]
+    fn 提示占掉底栏那一行() {
+        let mut app = panel_app();
+        app.notice = Some("祥鑫科技 已在自选".into());
+        let buf = render_full(140, 40, &app, &BarState::Loading, &panel());
+        let t = text_of(&buf, 140, 40);
+        assert!(t.contains("已在自选"), "{t}");
+    }
+
+    #[test]
+    fn 面板各尺寸都不panic且每行宽度等于终端宽() {
+        let p = panel();
+        for (w, h) in [(40u16, 24u16), (60, 24), (80, 24), (140, 40), (240, 70)] {
+            let buf = render_full(w, h, &panel_app(), &BarState::Loading, &p);
+            for y in 0..h {
+                let line_w: usize = (0..w)
+                    .scan(0u16, |x, _| {
+                        if *x >= w {
+                            return None;
+                        }
+                        let s = buf[(*x, y)].symbol();
+                        let sw = s.width().max(1);
+                        *x += sw as u16;
+                        Some(sw)
+                    })
+                    .sum();
+                assert_eq!(line_w, w as usize, "{w}x{h} 第 {y} 行宽度 {line_w} != {w}");
+            }
+        }
+    }
+
+    fn ai_app(text: &str) -> App {
+        let mut app = panel_app();
+        app.ai = Some(crate::ui::detail::AiPane {
+            state: crate::ui::detail::AiState::Ready(text.into()),
+            scroll: 0,
+            max_scroll: std::cell::Cell::new(0),
+        });
+        app
+    }
+
+    #[test]
+    fn 面板底栏告诉用户按问号要整组解读() {
+        let buf = render_full(140, 40, &panel_app(), &BarState::Loading, &panel());
+        assert!(text_of(&buf, 140, 40).contains("? AI 解读"), "底栏要告诉用户按哪个键");
+    }
+
+    #[test]
+    fn 面板的解读文本区盖住两张表并换掉底栏提示() {
+        let app = ai_app("机器生成的策略分析，不构成投资建议\n\n1. 祥鑫科技：确认刚成立 2 根。");
+        let t = text_of(&render_full(140, 40, &app, &BarState::Loading, &panel()), 140, 40);
+        assert!(t.contains("AI 解读"), "{t}");
+        assert!(t.contains("不构成投资建议"), "免责声明必须在屏幕上：{t}");
+        assert!(t.contains("Esc 关闭解读"), "底栏要换成文本区的键位：{t}");
+        assert!(!t.contains("板块热度"), "文本区开着时不该还画板块表：{t}");
+    }
+
+    #[test]
+    fn 面板解读打开时各尺寸不panic且每行宽度等于终端宽() {
+        let app = ai_app(&"机器生成的策略分析，不构成投资建议。祥鑫科技确认刚成立，维度不打架。".repeat(8));
+        let p = panel();
+        for (w, h) in [(40u16, 24u16), (60, 24), (80, 24), (140, 40), (240, 70)] {
+            let buf = render_full(w, h, &app, &BarState::Loading, &p);
+            for y in 0..h {
+                let mut line_w = 0usize;
+                let mut x = 0u16;
+                while x < w {
+                    let sw = buf[(x, y)].symbol().width().max(1);
+                    line_w += sw;
+                    x += sw as u16;
+                }
+                assert_eq!(line_w, w as usize, "{w}x{h} 第 {y} 行宽度 {line_w} != {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn 面板太小时沿用列表屏那套提示而不是画崩() {
+        let buf = render_full(30, 10, &panel_app(), &BarState::Loading, &panel());
+        assert!(text_of(&buf, 30, 10).contains("终端太小"));
+    }
+
+    #[test]
+    fn 扫描失败不影响自选股列表照常显示() {
+        // 报价刷新那条路跟扫描任务没有关系，扫描炸了自选股照看
+        let mut app = App::new();
+        app.scan_status = ScanStatus::Failed("新浪返回空".into());
+        let buf = render_full(140, 40, &app, &BarState::Loading, &Panel::default());
+        let t = text_of(&buf, 140, 40);
+        assert!(t.contains("贵州茅台"), "自选股行没了：{t}");
+        assert!(!t.contains("扫描失败"), "失败文案只该出现在面板里：{t}");
+    }
+
+    #[test]
+    fn 从面板进的详情画的是面板那只而不是自选股第一只() {
+        // 面板里的标的多半不在自选股里，详情屏要认面板的光标
+        let mut app = panel_app();
+        app.screen = Screen::Detail;
+        app.detail_from = Screen::Opportunities;
+        let buf = render_full(140, 40, &app, &BarState::Loading, &panel());
+        let t = text_of(&buf, 140, 40);
+        assert!(t.contains("CN:002965"), "详情屏画的不是面板那只：{t}");
+        assert!(!t.contains("CN:600519"), "画成自选股第一只了：{t}");
+    }
+
+    #[test]
+    fn 面板里显示扫描失败的原因() {
+        let mut app = panel_app();
+        app.scan_status = ScanStatus::Failed("新浪返回空".into());
+        let buf = render_full(140, 40, &app, &BarState::Loading, &panel());
+        assert!(text_of(&buf, 140, 40).contains("扫描失败：新浪返回空"));
+    }
+}
+
+#[cfg(test)]
+mod scan_gate_tests {
+    use super::*;
+
+    #[test]
+    fn 正在扫描时再触发一次不起第二个() {
+        let mut app = App::new();
+        assert!(should_start_scan(&mut app), "没在扫就该起一次");
+        assert!(app.scan_status.running());
+        // 启动自动扫已经在跑，这时按 r
+        assert!(!should_start_scan(&mut app), "两个扫描同时跑会对同一批接口重复打");
+        assert!(app.notice.as_deref() == Some("扫描正在进行中"), "{:?}", app.notice);
+    }
+
+    #[test]
+    fn 上一次扫完或扫崩之后还能再扫() {
+        for done in [ScanStatus::Done, ScanStatus::Failed("超时".into())] {
+            let mut app = App::new();
+            app.scan_status = done;
+            assert!(should_start_scan(&mut app));
+        }
     }
 }

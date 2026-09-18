@@ -2,18 +2,22 @@
 //!
 //! 三个市场三个源，日股暂时无源 —— 各自的字段格式与深度差异极大：
 //!
-//! | 市场 | 源 | 格式 | 深度 |
-//! |---|---|---|---|
-//! | A股 | 新浪 `money.finance` | 对象数组 `{day,open,high,low,close,volume}` | 全量（茅台 5990 根） |
-//! | 美股 | 新浪 `stock.finance` | 对象数组 `{d,o,h,l,c,v}` | 全量（AAPL 10018 根），**仅日线** |
-//! | 港股 | 腾讯 `ifzq` | 嵌套数组 `[日期, 开, 收, 高, 低, 量]` | 640 根 |
-//! | 日股 | — | — | **无** |
+//! | 市场 | 源 | 格式 | 深度 | 价格 |
+//! |---|---|---|---|---|
+//! | A股 | 新浪 `money.finance` | 对象数组 `{day,open,high,low,close,volume}` | 全量（茅台 5990 根） | **原始价** |
+//! | 美股 | 新浪 `stock.finance` | 对象数组 `{d,o,h,l,c,v}` | 全量（AAPL 10018 根），**仅日线** | 原始价 |
+//! | 港股 | 腾讯 `ifzq` | 嵌套数组 `[日期, 开, 收, 高, 低, 量]` | 640 根 | 前复权（`qfq` 参数） |
+//! | 日股 | — | — | **无** | — |
+//!
+//! A 股这一路给的是**未复权的原始价**，复权靠另一个因子接口（`adj_factors`）
+//! 在读库时折算，见 `core::adjust`。
 //!
 //! 腾讯那个数组的顺序是 **开-收-高-低**，不是 OHLC。照 OHLC 读会把收盘价当最高价。
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 
+use crate::core::adjust::AdjFactor;
 use crate::core::bar::{Bar, Timeframe};
 use crate::core::symbol::{Market, Symbol};
 use crate::source::throttle::Throttle;
@@ -30,12 +34,17 @@ pub enum HistoryError {
     },
     #[error("请求失败：{0}")]
     Http(String),
+    /// 免费源被限流时返回的是**空响应而不是错误码**，必须当失败处理，
+    /// 否则退避永远不会触发，只会被封得更久。
+    #[error("响应为空，多半是被限流了")]
+    Empty,
     #[error("响应无法解析：{0}")]
     Parse(String),
 }
 
 /// 免费源都会因连续请求封 IP，历史请求体积又大，间隔给得比报价更宽。
-const MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// 实测新浪约 10 次快速请求就开始返回空，6-8 秒间隔才稳，取 7 秒。
+const MIN_INTERVAL: Duration = Duration::from_secs(7);
 
 pub struct HistoryClient {
     http: reqwest::Client,
@@ -60,8 +69,34 @@ impl HistoryClient {
         limit: usize,
     ) -> Result<Vec<Bar>, HistoryError> {
         let (url, referer) = endpoint(symbol, tf, limit)?;
+        let body = self.get(&url, referer).await?;
+        self.finish(&body, symbol.market)
+    }
+
+    /// A 股的累计前复权因子。只有新浪有，也只有 A 股有 ——
+    /// 港股 K 线本身就是复权后的，美股与日股这条路不存在。
+    pub async fn adj_factors(&self, symbol: &Symbol) -> Result<Vec<AdjFactor>, HistoryError> {
+        if symbol.market != Market::Cn {
+            return Err(HistoryError::MarketUnsupported(symbol.market.as_str()));
+        }
+        let url = format!(
+            "https://finance.sina.com.cn/realstock/company/{}/qfq.js",
+            symbol.to_tencent()
+        );
+        let body = self.get(&url, Some(SINA_REF)).await?;
+        let factors = parse_sina_qfq(&body)?;
+        if factors.is_empty() {
+            self.throttle.penalize();
+            return Err(HistoryError::Empty);
+        }
+        self.throttle.reset();
+        Ok(factors)
+    }
+
+    /// 节流 + 取字节。HTTP 层的失败都在这里记退避。
+    async fn get(&self, url: &str, referer: Option<&str>) -> Result<Vec<u8>, HistoryError> {
         self.throttle.acquire().await;
-        let mut req = self.http.get(&url);
+        let mut req = self.http.get(url);
         if let Some(r) = referer {
             req = req.header("Referer", r);
         }
@@ -73,21 +108,31 @@ impl HistoryClient {
             self.throttle.penalize();
             return Err(HistoryError::Http(format!("HTTP {}", res.status())));
         }
-        let body = res
-            .bytes()
+        res.bytes()
             .await
-            .map_err(|e| HistoryError::Http(e.to_string()))?;
-        self.throttle.reset();
+            .map(|b| b.to_vec())
+            .map_err(|e| HistoryError::Http(e.to_string()))
+    }
 
-        let tz = symbol.market.timezone();
-        match symbol.market {
-            Market::Cn => parse_sina_cn(&body, tz),
-            Market::Us => parse_sina_us(&body, tz),
-            Market::Hk => parse_tencent(&body, tz),
+    /// 解析 + 判空 + 记账。单拎出来是为了不打真网络也能测「空响应触发退避」。
+    fn finish(&self, body: &[u8], market: Market) -> Result<Vec<Bar>, HistoryError> {
+        let tz = market.timezone();
+        let bars = match market {
+            Market::Cn => parse_sina_cn(body, tz),
+            Market::Us => parse_sina_us(body, tz),
+            Market::Hk => parse_tencent(body, tz),
             Market::Jp => Err(HistoryError::MarketUnsupported("日股")),
+        }?;
+        if bars.is_empty() {
+            self.throttle.penalize();
+            return Err(HistoryError::Empty);
         }
+        self.throttle.reset();
+        Ok(bars)
     }
 }
+
+const SINA_REF: &str = "https://finance.sina.com.cn";
 
 /// 返回 (url, referer)
 fn endpoint(
@@ -95,7 +140,6 @@ fn endpoint(
     tf: Timeframe,
     limit: usize,
 ) -> Result<(String, Option<&'static str>), HistoryError> {
-    const SINA_REF: &str = "https://finance.sina.com.cn";
     match symbol.market {
         Market::Cn => {
             let scale = match tf {
@@ -196,6 +240,8 @@ fn stamp(raw: &str, tz: Tz) -> Result<DateTime<Utc>, HistoryError> {
         .ok_or_else(|| HistoryError::Parse(format!("时区换算失败：{s:?}")))
 }
 
+/// 新浪 A 股日线 / 分钟线。**返回的是未复权的原始价** —— 落库存的就是它，
+/// 复权在读库时用 `adj_factors` 折算。
 pub fn parse_sina_cn(body: &[u8], tz: Tz) -> Result<Vec<Bar>, HistoryError> {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -278,6 +324,47 @@ pub fn parse_tencent(body: &[u8], tz: Tz) -> Result<Vec<Bar>, HistoryError> {
         .collect()
 }
 
+/// 新浪 `qfq.js` 的累计前复权因子。响应不是 JSON 而是一段 JS：
+/// `var sh600519qfq={"total":33,"data":[{"d":"2026-06-26","f":"1.0000..."},…]}`
+/// 后面还跟一段 `/* … */` 的随机注释。源里按除权日**倒序**，
+/// 这里统一翻成升序返回 —— `apply_factors` 要靠升序做二分。
+pub fn parse_sina_qfq(body: &[u8]) -> Result<Vec<AdjFactor>, HistoryError> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        d: String,
+        f: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        data: Vec<Row>,
+    }
+    let text = String::from_utf8_lossy(body);
+    // 去掉尾部注释再取第一个 `{` 起的对象字面量
+    let head = text.split("/*").next().unwrap_or("").trim_end();
+    let json = head
+        .find('{')
+        .map(|i| head[i..].trim_end_matches(';'))
+        .ok_or_else(|| HistoryError::Parse("qfq 响应里找不到对象字面量".into()))?;
+    let payload: Payload =
+        serde_json::from_str(json).map_err(|e| HistoryError::Parse(e.to_string()))?;
+    let mut out: Vec<AdjFactor> = payload
+        .data
+        .into_iter()
+        .map(|r| {
+            Ok(AdjFactor {
+                effective_date: r
+                    .d
+                    .trim()
+                    .parse()
+                    .map_err(|_| HistoryError::Parse(format!("除权日无法解析：{:?}", r.d)))?,
+                factor: f(&r.f)?,
+            })
+        })
+        .collect::<Result<_, HistoryError>>()?;
+    out.sort_by_key(|a| a.effective_date);
+    Ok(out)
+}
+
 /// 腾讯的周期键名不固定（day / qfqday / m60 …），递归找第一个「数组的数组」
 fn find_rows(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     match v {
@@ -295,6 +382,7 @@ mod tests {
     const CN_60M: &[u8] = include_bytes!("../../tests/fixtures/sina_cn_kline_60m.json");
     const US_DAY: &[u8] = include_bytes!("../../tests/fixtures/sina_us_kline_day.json");
     const HK_DAY: &[u8] = include_bytes!("../../tests/fixtures/tencent_hk_kline_day.json");
+    const QFQ: &[u8] = include_bytes!("../../tests/fixtures/sina_cn_qfq_sh600519.js");
 
     const SH: Tz = chrono_tz::Asia::Shanghai;
     const NY: Tz = chrono_tz::America::New_York;
@@ -415,5 +503,55 @@ mod tests {
         assert!(parse_sina_cn(b"not json", SH).is_err());
         assert!(parse_tencent(b"{}", HK).is_err());
         assert!(parse_sina_us(b"[]", NY).unwrap().is_empty());
+        assert!(parse_sina_qfq(b"not js").is_err());
+        assert!(parse_sina_qfq(b"var x={\"data\":[{\"d\":\"whenever\",\"f\":\"1\"}]}").is_err());
+    }
+
+    #[test]
+    fn qfq因子解析出全部条目并按日期升序() {
+        let fs = parse_sina_qfq(QFQ).unwrap();
+        assert_eq!(fs.len(), 33, "fixture 的 total 是 33");
+        for w in fs.windows(2) {
+            assert!(w[0].effective_date < w[1].effective_date, "必须升序且不重复");
+        }
+        assert_eq!(
+            fs.last().unwrap().effective_date,
+            "2026-06-26".parse::<chrono::NaiveDate>().unwrap()
+        );
+        assert!(
+            (fs.last().unwrap().factor - 1.0).abs() < 1e-12,
+            "最新一条因子必须是 1.0"
+        );
+        assert!(fs.iter().all(|a| a.factor > 0.0), "因子不能为零或负");
+    }
+
+    #[test]
+    fn qfq尾部的随机注释不影响解析() {
+        let raw = String::from_utf8_lossy(QFQ);
+        assert!(raw.contains("/*"), "fixture 应当带着源站那段注释，否则这个测试没意义");
+        let trimmed = raw.split("/*").next().unwrap().as_bytes().to_vec();
+        assert_eq!(parse_sina_qfq(QFQ).unwrap(), parse_sina_qfq(&trimmed).unwrap());
+    }
+
+    #[test]
+    fn 空响应触发退避而不是当成没有数据() {
+        // 新浪限流时给的就是 `[]`，当成「这只股票没有历史」会把库写空
+        let c = HistoryClient::new().unwrap();
+        assert!(matches!(c.finish(b"[]", Market::Cn), Err(HistoryError::Empty)));
+        assert!(c.throttle.current_backoff() > std::time::Duration::ZERO);
+        // 正常响应把退避清掉
+        assert!(c.finish(CN_DAY, Market::Cn).is_ok());
+        assert_eq!(c.throttle.current_backoff(), std::time::Duration::ZERO);
+    }
+
+    /// 在市场判断处就返回了，不会真的发请求
+    #[tokio::test]
+    async fn 非a股不给因子接口() {
+        let c = HistoryClient::new().unwrap();
+        let hk = Symbol::parse("HK:00700").unwrap();
+        assert!(matches!(
+            c.adj_factors(&hk).await,
+            Err(HistoryError::MarketUnsupported(_))
+        ));
     }
 }
