@@ -1,4 +1,5 @@
 mod core;
+mod scan;
 mod source;
 mod store;
 mod ui;
@@ -64,9 +65,13 @@ async fn main() -> anyhow::Result<()> {
             "souba — 终端行情与策略终端\n\n\
              用法：\n  \
              souba              打开自选股列表\n  \
-             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700"
+             souba <代码>       直接打开个股详情，例如 souba 600519 或 souba HK:00700\n  \
+             souba scan         拉板块列表、落库并打印板块热度榜"
         );
         return Ok(());
+    }
+    if arg.as_deref() == Some("scan") {
+        return scan::run_cli(&store).await;
     }
     let direct = match arg {
         Some(a) => Some(parse_cli_symbol(&a)?),

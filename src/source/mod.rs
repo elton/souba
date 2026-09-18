@@ -1,4 +1,5 @@
 pub mod history;
+pub mod sina_sector;
 pub mod tencent;
 pub mod throttle;
 

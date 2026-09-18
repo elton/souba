@@ -3,7 +3,8 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
-use crate::core::symbol::Symbol;
+use crate::core::sector::{Sector, Snapshot};
+use crate::core::symbol::{Market, Symbol};
 
 #[derive(Debug, Clone)]
 pub struct WatchItem {
@@ -100,6 +101,70 @@ impl Store {
         Ok(())
     }
 
+    /// 落一次板块列表与当日快照。
+    ///
+    /// 两张表一起写：`sectors` 是板块本身（改名了就更新），`sector_daily` 是当天的
+    /// 涨幅与成交额。都按主键幂等 —— 同一天重跑扫描只会覆盖当天那行。
+    pub fn record_sectors(
+        &self,
+        market: Market,
+        date: &str,
+        sectors: &[Sector],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let tx = conn.unchecked_transaction()?;
+        for s in sectors {
+            tx.execute(
+                "INSERT INTO sectors (market, code, name, kind, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch())
+                 ON CONFLICT(market, code) DO UPDATE SET
+                   name = excluded.name, kind = excluded.kind, updated_at = excluded.updated_at",
+                rusqlite::params![market.as_str(), s.code, s.name, s.kind.as_str()],
+            )?;
+            tx.execute(
+                "INSERT INTO sector_daily (market, sector_code, date, change_pct, turnover)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(market, sector_code, date) DO UPDATE SET
+                   change_pct = excluded.change_pct, turnover = excluded.turnover",
+                rusqlite::params![
+                    market.as_str(),
+                    s.code,
+                    date,
+                    s.snapshot.change_pct,
+                    s.snapshot.turnover
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `date` 之前最近 `days` 天的快照，用来算热度。不足就返回实际有的。
+    pub fn sector_history(
+        &self,
+        market: Market,
+        code: &str,
+        date: &str,
+        days: usize,
+    ) -> anyhow::Result<Vec<Snapshot>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT change_pct, turnover FROM sector_daily
+             WHERE market = ?1 AND sector_code = ?2 AND date < ?3
+             ORDER BY date DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![market.as_str(), code, date, days as i64],
+            |r| {
+                Ok(Snapshot {
+                    change_pct: r.get(0)?,
+                    turnover: r.get(1)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// 阶段 2 的 d 键会调用它。现在自选股靠 seed 预置，还没有删除入口。
     #[allow(dead_code)]
     pub fn remove(&self, symbol: &Symbol) -> anyhow::Result<()> {
@@ -184,6 +249,144 @@ mod tests {
         st.add(&sym("HK:700"), "腾讯控股").unwrap();
         // 港股补足五位后存储
         assert_eq!(st.watchlist().unwrap()[0].symbol.to_string(), "HK:00700");
+    }
+
+
+    fn sec(code: &str, name: &str, change_pct: f64, turnover: f64) -> Sector {
+        Sector {
+            code: code.into(),
+            name: name.into(),
+            kind: crate::core::sector::SectorKind::Industry,
+            snapshot: Snapshot {
+                change_pct,
+                turnover,
+            },
+        }
+    }
+
+    fn count(st: &Store, table: &str) -> i64 {
+        st.conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn 板块与当日快照落库后可读回() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_sectors(
+            Market::Cn,
+            "2026-09-18",
+            &[sec("new_blhy", "玻璃行业", -0.96, 2.0e10)],
+        )
+        .unwrap();
+        assert_eq!(count(&st, "sectors"), 1);
+        let (name, kind): (String, String) = st
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT name, kind FROM sectors WHERE market = 'CN' AND code = 'new_blhy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "玻璃行业");
+        assert_eq!(kind, "industry");
+        // 当天自己不算历史，要用第二天的日期才读得到它
+        let hist = st
+            .sector_history(Market::Cn, "new_blhy", "2026-09-19", 5)
+            .unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0].change_pct - -0.96).abs() < 1e-9);
+        assert!((hist[0].turnover - 2.0e10).abs() < 1.0);
+    }
+
+    #[test]
+    fn 同一天重跑不产生重复且覆盖数值() {
+        let st = Store::open_in_memory().unwrap();
+        let day = "2026-09-18";
+        st.record_sectors(Market::Cn, day, &[sec("new_blhy", "玻璃行业", 1.0, 100.0)])
+            .unwrap();
+        st.record_sectors(Market::Cn, day, &[sec("new_blhy", "玻璃行业", 2.5, 300.0)])
+            .unwrap();
+        assert_eq!(count(&st, "sectors"), 1);
+        assert_eq!(count(&st, "sector_daily"), 1);
+        let hist = st
+            .sector_history(Market::Cn, "new_blhy", "2026-09-19", 5)
+            .unwrap();
+        assert!((hist[0].change_pct - 2.5).abs() < 1e-9, "重跑应覆盖当天数值");
+        assert!((hist[0].turnover - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 板块改名只更新名称不动历史快照() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_sectors(Market::Cn, "2026-09-17", &[sec("gn_x", "旧名", 1.0, 100.0)])
+            .unwrap();
+        st.record_sectors(Market::Cn, "2026-09-18", &[sec("gn_x", "新名", 2.0, 200.0)])
+            .unwrap();
+        assert_eq!(count(&st, "sectors"), 1);
+        assert_eq!(count(&st, "sector_daily"), 2);
+        let name: String = st
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM sectors WHERE code = 'gn_x'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "新名");
+    }
+
+    #[test]
+    fn 历史按日期倒序且不含当天与未来() {
+        let st = Store::open_in_memory().unwrap();
+        for (d, c) in [
+            ("2026-09-14", 1.0),
+            ("2026-09-15", 2.0),
+            ("2026-09-16", 3.0),
+            ("2026-09-17", 4.0),
+            ("2026-09-18", 5.0),
+        ] {
+            st.record_sectors(Market::Cn, d, &[sec("gn_x", "某概念", c, c * 100.0)])
+                .unwrap();
+        }
+        let hist = st.sector_history(Market::Cn, "gn_x", "2026-09-17", 5).unwrap();
+        let got: Vec<f64> = hist.iter().map(|s| s.change_pct).collect();
+        assert_eq!(got, vec![3.0, 2.0, 1.0], "只要 09-17 之前的，且最近的在前");
+    }
+
+    #[test]
+    fn 历史条数受限于请求天数() {
+        let st = Store::open_in_memory().unwrap();
+        for i in 1..=10 {
+            st.record_sectors(
+                Market::Cn,
+                &format!("2026-09-{i:02}"),
+                &[sec("gn_x", "某概念", i as f64, 100.0)],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            st.sector_history(Market::Cn, "gn_x", "2026-09-20", 5).unwrap().len(),
+            5
+        );
+        assert!(
+            st.sector_history(Market::Cn, "gn_x", "2026-09-01", 5).unwrap().is_empty(),
+            "没有更早的快照时应返回空而不是报错"
+        );
+    }
+
+    #[test]
+    fn 不同市场的同名板块互不干扰() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_sectors(Market::Cn, "2026-09-17", &[sec("x", "A", 1.0, 100.0)])
+            .unwrap();
+        st.record_sectors(Market::Hk, "2026-09-17", &[sec("x", "B", 9.0, 900.0)])
+            .unwrap();
+        let hist = st.sector_history(Market::Cn, "x", "2026-09-18", 5).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!((hist[0].change_pct - 1.0).abs() < 1e-9);
     }
 
     /// 阶段 1 的 schema，冻结在测试里当 fixture —— 它描述的是「线上旧库长什么样」，
