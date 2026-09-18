@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
-use crate::core::sector::{Sector, Snapshot};
+use crate::core::sector::{Member, Sector, Snapshot};
 use crate::core::symbol::{Market, Symbol};
 use crate::core::adjust::{AdjFactor, apply_factors};
 use crate::core::bar::{Bar, Timeframe};
@@ -157,6 +157,65 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// 某个板块当日的前 K 只候选。名次按 `members` 的顺序，从 1 起。
+    /// 幂等：同一天重跑覆盖，不会堆出重复行。
+    pub fn record_members(
+        &self,
+        market: Market,
+        sector_code: &str,
+        as_of: &str,
+        members: &[Member],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let tx = conn.unchecked_transaction()?;
+        for (i, m) in members.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO sector_members (market, sector_code, symbol, name, as_of, rank)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(market, sector_code, as_of, symbol) DO UPDATE SET
+                   name = excluded.name, rank = excluded.rank",
+                rusqlite::params![
+                    market.as_str(),
+                    sector_code,
+                    m.symbol.to_string(),
+                    m.name,
+                    as_of,
+                    i as i64 + 1
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 某个板块某天落库的候选，按名次升序。落库是 06 票的输入，
+    /// 本票只写不读，所以读这条路先只给测试用。
+    #[cfg(test)]
+    pub fn sector_members(
+        &self,
+        market: Market,
+        sector_code: &str,
+        as_of: &str,
+    ) -> anyhow::Result<Vec<(usize, String, String)>> {
+        let conn = self.conn.lock().expect("store 锁中毒");
+        let mut stmt = conn.prepare(
+            "SELECT rank, symbol, name FROM sector_members
+             WHERE market = ?1 AND sector_code = ?2 AND as_of = ?3
+             ORDER BY rank",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![market.as_str(), sector_code, as_of],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as usize,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// `date` 之前最近 `days` 天的快照，用来算热度。不足就返回实际有的。
@@ -563,6 +622,51 @@ mod tests {
             st.sector_history(Market::Cn, "gn_x", "2026-09-01", 5).unwrap().is_empty(),
             "没有更早的快照时应返回空而不是报错"
         );
+    }
+
+    fn mem(code: &str, name: &str, change_pct: f64) -> crate::core::sector::Member {
+        crate::core::sector::Member {
+            symbol: sym(code),
+            name: name.into(),
+            change_pct,
+        }
+    }
+
+    #[test]
+    fn 候选按名次落库且同日重跑幂等() {
+        let st = Store::open_in_memory().unwrap();
+        let day = "2026-09-18";
+        st.record_members(
+            Market::Cn,
+            "gn_hwqc",
+            day,
+            &[mem("CN:002965", "祥鑫科技", 10.0), mem("CN:002902", "铭普光磁", 7.0)],
+        )
+        .unwrap();
+        // 同一天重抓，名次换了 —— 该覆盖，不该多出行
+        st.record_members(
+            Market::Cn,
+            "gn_hwqc",
+            day,
+            &[mem("CN:002902", "铭普光磁", 9.0), mem("CN:002965", "祥鑫科技", 8.0)],
+        )
+        .unwrap();
+        assert_eq!(count(&st, "sector_members"), 2);
+        let got = st.sector_members(Market::Cn, "gn_hwqc", day).unwrap();
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[0].1, "CN:002902");
+        assert_eq!(got[1].1, "CN:002965");
+    }
+
+    #[test]
+    fn 候选按板块与日期分开存() {
+        let st = Store::open_in_memory().unwrap();
+        let m = [mem("CN:002965", "祥鑫科技", 10.0)];
+        st.record_members(Market::Cn, "gn_hwqc", "2026-09-18", &m).unwrap();
+        st.record_members(Market::Cn, "new_blhy", "2026-09-18", &m).unwrap();
+        st.record_members(Market::Cn, "gn_hwqc", "2026-09-17", &m).unwrap();
+        assert_eq!(count(&st, "sector_members"), 3, "同一只在不同板块 / 不同日各占一行");
+        assert_eq!(st.sector_members(Market::Cn, "gn_hwqc", "2026-09-18").unwrap().len(), 1);
     }
 
     #[test]

@@ -1,13 +1,22 @@
-//! 扫描编排：拉板块列表 → 落库 → 按热度排序 → 输出。
+//! 扫描编排：拉板块列表 → 落库 → 按热度排序 → 每个板块取候选 → 回补缺的历史 → 输出。
 //!
 //! 这一层保持薄：能测的东西都在 `core::sector`（热度）与 `store`（幂等落库）里，
 //! 这里只负责把它们串起来和排版。
+//!
+//! 回补是长任务（首日约 160 只 × 7 秒 ≈ 19 分钟），这里同步等完；
+//! 中途 Ctrl-C 不会丢进度，`backfill_state` 记着补到哪了，下次接着补。
+
+use std::collections::HashSet;
+use std::io::Write;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::core::sector::{Heat, Sector, SectorKind, heat};
-use crate::core::symbol::Market;
-use crate::source::sina_sector::SectorSource;
+use crate::core::bar::Timeframe;
+use crate::core::sector::{Heat, Member, Sector, SectorKind, heat};
+use crate::core::symbol::{Market, Symbol};
+use crate::source::history::HistoryClient;
+use crate::source::sina_sector::{Members, SectorSource};
+use crate::source::backfill;
 use crate::store::Store;
 
 /// 扫描参数。默认值来自 spec 的「默认参数」一节。
@@ -33,7 +42,85 @@ pub async fn run_cli(store: &Store) -> anyhow::Result<()> {
     let total = all.len();
     let ranked = rank(store, &date, all, &p)?;
     print!("{}", render(&date, total, &ranked, &p));
+
+    // 每个热门板块取涨幅前 K 只做候选。一个板块拉不到不该让整次扫描白跑 ——
+    // 板块列表已经落库了，其余板块的候选照常取。
+    let mut by_sector = Vec::with_capacity(ranked.len());
+    for r in &ranked {
+        match src.members(&r.sector.code, p.k).await {
+            Ok(got) => {
+                store.record_members(Market::Cn, &r.sector.code, &date, &got.list)?;
+                print!("{}", render_members(&r.sector.name, &got));
+                by_sector.push(got.list);
+            }
+            Err(e) => println!("\n{}　候选拉取失败：{e}", r.sector.name),
+        }
+    }
+
+    let q = queue(store, &by_sector)?;
+    backfill_all(store, q).await
+}
+
+/// 逐只回补并打印进度。单只失败只记下来继续 —— 一只退市股拉不到历史，
+/// 不该把后面一百多只一起废掉。
+async fn backfill_all(store: &Store, q: Queue) -> anyhow::Result<()> {
+    let client = HistoryClient::new()?;
+    let total = q.pending.len();
+    println!("\n候选 {} 只（去重后），其中 {} 只已有历史，需回补 {total} 只", q.ready + total, q.ready);
+    let mut done = 0usize;
+    let mut failed = Vec::new();
+    for (i, m) in q.pending.iter().enumerate() {
+        print!("回补 {}/{total}　{} {}　", i + 1, m.symbol, m.name);
+        let _ = std::io::stdout().flush();
+        match backfill::run(store, &client, &m.symbol).await {
+            Ok(n) => {
+                done += 1;
+                println!("{n} 根");
+            }
+            Err(e) => {
+                println!("失败：{e}");
+                failed.push((m.clone(), e.to_string()));
+            }
+        }
+    }
+    println!(
+        "\n回补汇总：已有历史 {} 只，本次补齐 {done} 只，失败 {} 只",
+        q.ready,
+        failed.len()
+    );
+    for (m, e) in &failed {
+        println!("  {} {}　{e}", m.symbol, m.name);
+    }
     Ok(())
+}
+
+/// 回补队列。
+struct Queue {
+    /// 还缺历史的候选，顺序 = 板块热度序 × 板块内名次，已按标的去重
+    pending: Vec<Member>,
+    /// 已有全量历史、不用补的候选只数（去重后）
+    ready: usize,
+}
+
+/// 按「板块热度序 × 板块内名次」把候选摊平去重，滤掉已经补完的。
+///
+/// 去重是必需的：概念板块大量重叠，同一只出现在三四个板块里很常见，
+/// 不去重就会对同一只重复打七秒一次的接口。
+fn queue(store: &Store, by_sector: &[Vec<Member>]) -> anyhow::Result<Queue> {
+    let mut seen: HashSet<Symbol> = HashSet::new();
+    let mut pending = Vec::new();
+    let mut ready = 0;
+    for m in by_sector.iter().flatten() {
+        if !seen.insert(m.symbol.clone()) {
+            continue;
+        }
+        if backfill::needs(store, &m.symbol, Timeframe::Day)? {
+            pending.push(m.clone());
+        } else {
+            ready += 1;
+        }
+    }
+    Ok(Queue { pending, ready })
 }
 
 async fn fetch(src: &SectorSource, kind: SectorKind) -> anyhow::Result<Vec<Sector>> {
@@ -109,6 +196,24 @@ fn render(date: &str, total: usize, ranked: &[Ranked], p: &ScanParams) -> String
     out
 }
 
+fn render_members(sector: &str, got: &Members) -> String {
+    let skipped = match got.skipped {
+        0 => String::new(),
+        n => format!("，跳过 {n} 只代码无法识别的"),
+    };
+    let mut out = format!("\n{sector}　候选 {} 只{skipped}\n", got.list.len());
+    for (i, m) in got.list.iter().enumerate() {
+        out.push_str(&format!(
+            "  {} {}  {}  {:+.2}%\n",
+            pad(&format!("{}", i + 1), 3),
+            pad(&m.symbol.to_string(), 10),
+            pad(&m.name, 12),
+            m.change_pct,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +242,85 @@ mod tests {
             .unwrap();
         }
         st
+    }
+
+    fn mem(code: &str, name: &str, change_pct: f64) -> Member {
+        Member {
+            symbol: Symbol::parse(code).unwrap(),
+            name: name.into(),
+            change_pct,
+        }
+    }
+
+    #[test]
+    fn 已有完整历史的不入队() {
+        let st = Store::open_in_memory().unwrap();
+        let done = Symbol::parse("CN:600519").unwrap();
+        st.set_backfill_status(&done, Timeframe::Day, backfill::DONE).unwrap();
+        // 补了一半的那只必须照样入队，否则重启后永远停在半截
+        let half = Symbol::parse("CN:000001").unwrap();
+        st.set_backfill_status(&half, Timeframe::Day, backfill::RUNNING).unwrap();
+
+        let q = queue(
+            &st,
+            &[vec![
+                mem("CN:600519", "贵州茅台", 1.0),
+                mem("CN:000001", "平安银行", 2.0),
+                mem("CN:300750", "宁德时代", 3.0),
+            ]],
+        )
+        .unwrap();
+        let got: Vec<String> = q.pending.iter().map(|m| m.symbol.to_string()).collect();
+        assert_eq!(got, ["CN:000001", "CN:300750"]);
+        assert_eq!(q.ready, 1);
+    }
+
+    #[test]
+    fn 队列顺序是板块热度序乘板块内名次且跨板块去重() {
+        let st = Store::open_in_memory().unwrap();
+        let q = queue(
+            &st,
+            &[
+                vec![mem("CN:600519", "甲", 9.0), mem("CN:000001", "乙", 8.0)],
+                // 第二个板块跟第一个重叠一只，它已经排过了，不该再来一次
+                vec![mem("CN:000001", "乙", 8.0), mem("CN:300750", "丙", 7.0)],
+            ],
+        )
+        .unwrap();
+        let got: Vec<String> = q.pending.iter().map(|m| m.symbol.to_string()).collect();
+        assert_eq!(got, ["CN:600519", "CN:000001", "CN:300750"]);
+        assert_eq!(q.ready, 0);
+    }
+
+    #[test]
+    fn 候选行带代码名称与涨幅() {
+        let got = Members {
+            list: vec![mem("CN:002965", "祥鑫科技", 10.007), mem("CN:002786", "银宝山新", -1.5)],
+            skipped: 2,
+        };
+        let text = render_members("华为汽车", &got);
+        assert!(text.contains("华为汽车"), "{text}");
+        assert!(text.contains("候选 2 只"), "{text}");
+        assert!(text.contains("跳过 2 只"), "跳过的要说出来，不能静默：{text}");
+        assert!(text.contains("CN:002965") && text.contains("祥鑫科技"), "{text}");
+        assert!(text.contains("+10.01%") && text.contains("-1.50%"), "{text}");
+    }
+
+    #[test]
+    fn 候选行中文名按显示格对齐() {
+        let got = Members {
+            list: vec![mem("CN:002965", "祥鑫科技", 1.0), mem("CN:002786", "银宝山新A", 2.0)],
+            skipped: 0,
+        };
+        let text = render_members("华为汽车", &got);
+        // 首行是空行、次行是板块标题，候选行从第 3 行起
+        let cols: Vec<usize> = text
+            .lines()
+            .skip(2)
+            .map(|l| l[..l.find('%').unwrap()].width())
+            .collect();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0], cols[1], "涨幅列没对齐：\n{text}");
     }
 
     #[test]

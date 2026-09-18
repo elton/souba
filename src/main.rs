@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
              souba set <键> <值>  修改策略与扫描参数\n  \
              souba get <键>       查看某个参数的当前值与默认值\n  \
              souba settings       列出全部参数\n  \
-             souba scan           拉板块列表、落库并打印板块热度榜"
+             souba scan           拉板块与候选、回补缺的历史并打印热度榜"
         );
         return Ok(());
     }
