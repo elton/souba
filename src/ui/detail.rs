@@ -44,6 +44,9 @@ impl IndicatorKind {
 #[derive(Debug, Clone)]
 pub enum BarState {
     Loading,
+    /// 本地一根都没有，正在从源回补全量历史。与 `Loading` 分开是因为
+    /// 它要等十几秒（两次请求 + 7 秒节流），得让用户知道在等什么。
+    Backfilling,
     Ready(Vec<Bar>),
     Unsupported(String),
     Failed(String),
@@ -539,6 +542,10 @@ fn render_placeholder(
 ) {
     let (msg, color) = match state {
         BarState::Loading => (format!("正在加载 {} 数据…", v.timeframe.label()), Color::DarkGray),
+        BarState::Backfilling => (
+            "正在回补历史日线…（首次打开要拉全量，约十几秒）".to_string(),
+            Color::Cyan,
+        ),
         BarState::Ready(_) => ("该周期没有数据".to_string(), Color::DarkGray),
         BarState::Unsupported(why) => (why.clone(), Color::Yellow),
         BarState::Failed(why) => (format!("加载失败：{why}"), Color::Red),
@@ -571,11 +578,12 @@ mod tests {
     }
 
     #[test]
-    fn 三种缺数据状态互不相同() {
-        // 加载中 / 无数据源 / 出错 对用户意味着完全不同的事，
+    fn 四种缺数据状态互不相同() {
+        // 加载中 / 回补中 / 无数据源 / 出错 对用户意味着完全不同的事，
         // 不能都渲染成同一个空白面板
         let states = [
             BarState::Loading,
+            BarState::Backfilling,
             BarState::Unsupported("日股无源".into()),
             BarState::Failed("超时".into()),
         ];
@@ -583,7 +591,7 @@ mod tests {
             .iter()
             .map(|s| format!("{:?}", std::mem::discriminant(s)))
             .collect();
-        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.len(), 4);
     }
 }
 
@@ -641,10 +649,20 @@ mod axis_tests {
         vp: Viewport,
         tf: Timeframe,
     ) -> ratatui::buffer::Buffer {
+        draw_state(w, h, &BarState::Ready(bars(n)), backend, vp, tf)
+    }
+
+    fn draw_state(
+        w: u16,
+        h: u16,
+        state: &BarState,
+        backend: crate::ui::surface::Backend,
+        vp: Viewport,
+        tf: Timeframe,
+    ) -> ratatui::buffer::Buffer {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut surface = Surface::new(backend);
         let sym = crate::core::symbol::Symbol::parse("CN:600519").unwrap();
-        let state = BarState::Ready(bars(n));
         term.draw(|f| {
             render(
                 f,
@@ -654,7 +672,7 @@ mod axis_tests {
                     quote: None,
                     timeframe: tf,
                     indicator: IndicatorKind::Macd,
-                    bars: &state,
+                    bars: state,
                     viewport: vp,
                     surface_label: backend.label(),
                     mouse: None,
@@ -702,6 +720,47 @@ mod axis_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn 回补中的文案说明在回补而不是笼统的加载中() {
+        let braille = crate::ui::surface::Backend::Braille;
+        let t = text(
+            &draw_state(120, 40, &BarState::Backfilling, braille, Viewport::default(), Timeframe::Day),
+            120,
+            40,
+        );
+        assert!(t.contains("回补"), "首次打开要让用户知道在补历史：{t}");
+        let loading = text(
+            &draw_state(120, 40, &BarState::Loading, braille, Viewport::default(), Timeframe::Day),
+            120,
+            40,
+        );
+        assert!(!loading.contains("回补"), "普通加载中不该说在回补");
+    }
+
+    /// 从本地库读出多少根就显示多少根 —— 腾讯那条路封顶 640，落库之后不该再被它限住
+    #[test]
+    fn 根数跟着本地库的真实根数走() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let sym = crate::core::symbol::Symbol::parse("CN:600519").unwrap();
+        store.upsert_bars(&sym, Timeframe::Day, &bars(800)).unwrap();
+        let local = store.adjusted_bars(&sym, Timeframe::Day).unwrap();
+        assert_eq!(local.len(), 800);
+        let t = text(
+            &draw_state(
+                200,
+                40,
+                &BarState::Ready(local),
+                crate::ui::surface::Backend::Braille,
+                Viewport::default(),
+                Timeframe::Day,
+            ),
+            200,
+            40,
+        );
+        assert!(t.contains("共 800"), "标题应写本地真实根数：{}", &t[..200.min(t.len())]);
+        assert!(!t.contains("共 640"));
     }
 
     #[test]
