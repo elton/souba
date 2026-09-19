@@ -16,8 +16,10 @@
 > 各市场历史源，推翻了初版的两条结论：**Alpaca 免费档的历史不是 IEX 子集**（第 4a 节）、
 > **日股历史有源**（第 4b 节）。新增第 3c 节（新浪返回原始价）与第 5 节（板块分类与成分股）。
 > **测试环境与初版相同：所有 `curl` 来自日本 KDDI 的住宅/移动 IP，不是 Cloudflare Worker 出口。**
-> Worker 侧可达性仍然只在阶段 0 对腾讯/新浪验证过，其余域名（尤其 `finance.yahoo.co.jp`、
-> `jpx.co.jp`、`alpaca.markets`）**一次都没从 Worker 打过**。
+> Worker 侧可达性：阶段 0 验证了腾讯/新浪；**2026-09-19 用 Worker 的 `/probe` 又打了
+> `finance.yahoo.co.jp`（history 页，200，315 KB，含 `id="histlist"`）、`jpx.co.jp/…/data_j.xlsx`（200，228 KB）、
+> GitHub raw 的 S&P 500 CSV（200，53 KB），全部通过**。`alpaca.markets` 要 key 且只从 TUI 调，
+> 在本机验证（日线回溯到 2016、SIP 成交量）。
 
 ## 结论速览
 
@@ -251,8 +253,8 @@ https://finance.yahoo.co.jp/quote/7203.T/history?from=20100101&to=20101231
 两个注意事项：
 
 - `<td>` 的 class 一样带构建哈希，**只能靠 `id="histlist"` 定位**，绝不要写 class 选择器。
-- **Worker 出口对 `.co.jp` 的可达性未测。** 它和已经确认 429 的 Yahoo 国际站
-  **不是同一套 WAF**，不能拿国际站的结果推断 —— 下一块开工前必须从 Worker 实打一次。
+- **Worker 出口对 `.co.jp` 已验证可达（2026-09-19）**：`/probe` 从 Worker 打 history 页返回 200、
+  315 KB、页内有 `id="histlist"`。它和已经确认 429 的 Yahoo 国际站**不是同一套 WAF**，这次实测证明了这点。
 
 J-Quants 免费档的官方原文窗口是「**12 週間前〜2 年 12 週間前**」（约 1.77 年），即**滞后 12 周**；
 **一年后自动解约，但可以重新注册**，注册不需要信用卡。

@@ -546,7 +546,7 @@ async function getSectors(url: URL, env: Env): Promise<Response> {
 
 // 阶段 0 的出口探测保留下来：下一块要从 Worker 验证 finance.yahoo.co.jp 的可达性，
 // 改 TARGETS 即可，不用再搭一遍。
-const PROBE_TARGETS: { name: string; url: string; headers?: Record<string, string> }[] = [
+const PROBE_TARGETS: { name: string; url: string; headers?: Record<string, string>; marker?: string }[] = [
   { name: 'tencent-quote-batch', url: 'https://qt.gtimg.cn/q=sh600519,r_hk00700,usAAPL,jp7203' },
   {
     name: 'tencent-kline-day',
@@ -561,6 +561,20 @@ const PROBE_TARGETS: { name: string; url: string; headers?: Record<string, strin
     name: 'sina-kline-full',
     url: 'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh600519&scale=240&ma=no&datalen=6000',
     headers: { Referer: 'https://finance.sina.com.cn' },
+  },
+  // 下面三个是港美日那一块要用的源，2026-09-19 加进来验 Worker 出口可达性
+  {
+    name: 'yahoo-jp-history',
+    url: 'https://finance.yahoo.co.jp/quote/7203.T/history?from=20200101&to=20200131',
+    marker: 'id="histlist"',
+  },
+  {
+    name: 'jpx-data-j-xlsx',
+    url: 'https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx',
+  },
+  {
+    name: 'sp500-gics-csv',
+    url: 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv',
   },
 ]
 
@@ -577,6 +591,9 @@ async function probe(req: Request): Promise<Response> {
           ok: res.ok,
           status: res.status,
           ms: Date.now() - started,
+          bytes: buf.byteLength,
+          // 只截样本看编码；整页有没有目标标记另外用 marker 判断，免得样本塞爆响应
+          marker: t.marker ? new TextDecoder('utf-8').decode(buf).includes(t.marker) : undefined,
           sample: new TextDecoder('gbk').decode(buf).slice(0, 1200),
         }
       } catch (e) {

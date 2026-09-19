@@ -23,8 +23,10 @@ The next block is **not** "all four markets" but the **A-share closed loop** —
 [`docs/specs/2026-09-18-A股闭环.md`](docs/specs/2026-09-18-A股闭环.md): sector scan, history
 persisted locally, Vegas, the opportunity panel, AI reading and D1 sync. Its §一页纸架构 fixes the
 cross-phase decisions (schema, adjustment model, one hourly Cron) for HK/US/JP too — do not overturn
-them per market. **Worker egress has only ever been proven for Tencent and Sina**; every other host
-(`finance.yahoo.co.jp`, `jpx.co.jp`, `alpaca.markets`) is still untested from a Worker.
+them per market. **Worker egress is proven for Tencent, Sina, `finance.yahoo.co.jp` (history page,
+`id="histlist"` present, 315 KB), `jpx.co.jp` (`data_j.xlsx`) and GitHub raw** — all 200 on 2026-09-19
+via the Worker's `/probe`. `alpaca.markets` needs a key and is only called from the TUI, so it is
+verified from the local machine instead (daily bars back to 2016, SIP volume).
 
 ## Verified facts that must not be re-derived
 
@@ -80,7 +82,7 @@ called from an actual Worker.
   (日付/始値/高値/安値/終値/出来高/調整後終値, 20 rows per page) and the range params jump to any year —
   measured back to 2010. The `<td>` classes carry build hashes, so **locate by `id`, never by class**.
   This is a different page from the *quote* page above, whose RSC-flight fragility still stands.
-  **Worker egress to `.co.jp` is untested** — it is not the same WAF as the Yahoo international site.
+  **Worker egress to `.co.jp` is verified (2026-09-19, 200, `histlist` present)** — it is not the same WAF as the Yahoo international site.
 - **Alpaca's free tier is IEX-only for REALTIME, but SIP-full for HISTORY.** Anything older than 15
   minutes defaults to the full SIP tape unless you pass `feed=iex`; daily bars go back to 2016, 5/15/60-min
   bars are included, 200 requests/min, max 10000 bars per call. Email signup, worldwide, no identity
@@ -121,9 +123,9 @@ Three of them are load-bearing:
 - **Worker egress has been verified for Tencent and Sina only** (phase 0, 2026-08-26, KIX colo): six
   calls including two spaced 7 s apart, all 200, no sign of blocking; `TextDecoder('gbk')` works in
   workerd; 2-3 ms CPU even decoding a 647 KB body; and the "force HTTP/1.1" trap does not exist on
-  Worker `fetch`. **Every other host is still unverified from a Worker** — Yahoo already 429s shared
-  datacenter IPs, so `finance.yahoo.co.jp`, `jpx.co.jp` and `alpaca.markets` must each be probed from
-  a Worker before the phase-3 block depends on them. The architecture hedges this — live quotes come
+  Worker `fetch`. **2026-09-19: `finance.yahoo.co.jp` (history page), `jpx.co.jp` and GitHub raw
+  also return 200 from the Worker** — the Yahoo *international* 429 does not carry over to the `.co.jp`
+  WAF. Re-run `/probe` (targets in `PROBE_TARGETS`) before trusting a new host. The architecture hedges this — live quotes come
   from the TUI, so Worker IP reputation only affects the daily append path, which can fall back to the
   TUI as well.
 - **Cron Triggers are 5 per ACCOUNT**, not per Worker. `eltonzheng-me` already uses one
